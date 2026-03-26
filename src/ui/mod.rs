@@ -58,6 +58,17 @@ pub struct SceneUiState {
     pub entity_count: usize,
 }
 
+/// State shared between the editor panel and the main loop.
+/// Mirrors the selected entity's transform for display/editing in egui.
+pub struct EditorUiState {
+    pub selected_entity: Option<hecs::Entity>,
+    pub position: [f32; 3],
+    pub rotation_euler_deg: [f32; 3],  // degrees for display
+    pub scale: [f32; 3],
+    pub gizmo_mode: u8,  // 0=Translate, 1=Rotate, 2=Scale
+    pub transform_changed: bool,  // set by panel when sliders edited
+}
+
 /// Wraps egui context + winit state. Renderer lives in VulkanContext to keep
 /// Vulkan concerns together.
 pub struct DebugUi {
@@ -99,6 +110,7 @@ impl DebugUi {
         scene: &mut SceneUiState,
         physics: &mut PhysicsUiState,
         audio: &mut AudioUiState,
+        editor: &mut EditorUiState,
     ) -> (Vec<egui::ClippedPrimitive>, egui::TexturesDelta) {
         let raw_input = self.winit_state.take_egui_input(window);
         let output = self.ctx.run(raw_input, |ctx| {
@@ -108,6 +120,7 @@ impl DebugUi {
             panels::scene_panel(ctx, scene);
             panels::physics_panel(ctx, physics);
             panels::audio_panel(ctx, audio);
+            panels::editor_panel(ctx, editor);
         });
         self.winit_state.handle_platform_output(window, output.platform_output);
         let clipped = self.ctx.tessellate(output.shapes, output.pixels_per_point);

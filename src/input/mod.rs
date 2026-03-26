@@ -9,6 +9,12 @@ pub struct InputState {
     pub sprint: bool,
     /// Raw mouse delta accumulated since last `clear_frame_deltas()`.
     pub mouse_delta: Vec2,
+    /// True when egui is consuming pointer/keyboard events — camera should not respond.
+    pub ui_captured: bool,
+    /// Left stick (X = strafe, Y = forward/back). Range [-1, 1], dead-zone applied.
+    pub gamepad_move: Vec2,
+    /// Right stick (X = yaw, Y = pitch). Range [-1, 1], dead-zone applied.
+    pub gamepad_look: Vec2,
 }
 
 impl InputState {
@@ -20,7 +26,15 @@ impl InputState {
             right: false,
             sprint: false,
             mouse_delta: Vec2::ZERO,
+            ui_captured: false,
+            gamepad_move: Vec2::ZERO,
+            gamepad_look: Vec2::ZERO,
         }
+    }
+
+    /// Called by the UI layer to block camera input when egui is active.
+    pub fn set_captured(&mut self, captured: bool) {
+        self.ui_captured = captured;
     }
 
     /// Reset per-frame accumulators. Call once at the start of each frame.

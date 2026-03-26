@@ -1,5 +1,5 @@
 use anyhow::Result;
-use glam::Mat4;
+use glam::{Mat4, Vec3};
 
 use crate::engine::vertex::Vertex;
 
@@ -37,6 +37,9 @@ pub struct MeshData {
     pub transform: Mat4,
     /// None → default material.
     pub material_index: Option<usize>,
+    /// Axis-aligned bounding box in local (model) space, computed from vertices.
+    pub aabb_min: Vec3,
+    pub aabb_max: Vec3,
 }
 
 /// Full CPU-side scene.
@@ -137,10 +140,18 @@ fn collect_node(
 
     if let Some(mesh) = node.mesh() {
         for primitive in mesh.primitives() {
-            if let Some((vertices, indices)) = load_primitive(&primitive, buffers) {
-                // gltf default material has index() == None
+            if let Some((vertices, indices, aabb_min, aabb_max)) =
+                load_primitive(&primitive, buffers)
+            {
                 let material_index = primitive.material().index();
-                out.push(MeshData { vertices, indices, transform: world, material_index });
+                out.push(MeshData {
+                    vertices,
+                    indices,
+                    transform: world,
+                    material_index,
+                    aabb_min,
+                    aabb_max,
+                });
             }
         }
     }
@@ -153,7 +164,7 @@ fn collect_node(
 fn load_primitive(
     primitive: &gltf::Primitive,
     buffers: &[gltf::buffer::Data],
-) -> Option<(Vec<Vertex>, Vec<u32>)> {
+) -> Option<(Vec<Vertex>, Vec<u32>, Vec3, Vec3)> {
     if primitive.mode() != gltf::mesh::Mode::Triangles {
         return None;
     }
@@ -196,7 +207,16 @@ fn load_primitive(
         .map(|i| i.into_u32().collect())
         .unwrap_or_else(|| (0..count as u32).collect());
 
-    Some((vertices, indices))
+    // Compute local-space AABB from vertex positions.
+    let mut aabb_min = Vec3::splat(f32::MAX);
+    let mut aabb_max = Vec3::splat(f32::MIN);
+    for v in &vertices {
+        let p = Vec3::from(v.position);
+        aabb_min = aabb_min.min(p);
+        aabb_max = aabb_max.max(p);
+    }
+
+    Some((vertices, indices, aabb_min, aabb_max))
 }
 
 /// Convert a gltf image to RGBA8. Returns (pixels, width, height).
@@ -215,6 +235,59 @@ fn to_rgba8(img: &gltf::image::Data) -> (Vec<u8>, u32, u32) {
         }
     };
     (pixels, img.width, img.height)
+}
+
+// ---------------------------------------------------------------------------
+// Multi-model loader — merges N glTF files into one flat SceneData
+// ---------------------------------------------------------------------------
+
+/// Load multiple glTF/glb files and merge them into a single `SceneData` with
+/// globally consistent texture/material/mesh indices.
+///
+/// Index offsets are applied so that `MeshData::material_index` and
+/// `MaterialData::*_tex` all reference the merged arrays correctly.
+/// Failed models are skipped with a warning; if nothing loads, falls back to
+/// the builtin cube.
+///
+/// Returns `(merged_scene, mesh_offsets)` where `mesh_offsets[i]` is the index
+/// of the first mesh contributed by `paths[i]` in the merged mesh array.
+pub fn load_multi_glb(paths: &[String]) -> Result<(SceneData, Vec<usize>)> {
+    let mut merged = SceneData { meshes: vec![], textures: vec![], materials: vec![] };
+    let mut mesh_offsets: Vec<usize> = Vec::with_capacity(paths.len());
+
+    for path in paths {
+        let tex_offset = merged.textures.len();
+        let mat_offset = merged.materials.len();
+        let mesh_offset = merged.meshes.len();
+        mesh_offsets.push(mesh_offset);
+
+        match load_glb(path) {
+            Ok(mut scene) => {
+                // Re-map texture indices inside materials.
+                for mat in &mut scene.materials {
+                    mat.albedo_tex            = mat.albedo_tex.map(|i| i + tex_offset);
+                    mat.normal_tex            = mat.normal_tex.map(|i| i + tex_offset);
+                    mat.metallic_roughness_tex = mat.metallic_roughness_tex.map(|i| i + tex_offset);
+                }
+                // Re-map material indices inside meshes.
+                for mesh in &mut scene.meshes {
+                    mesh.material_index = mesh.material_index.map(|i| i + mat_offset);
+                }
+                merged.textures.extend(scene.textures);
+                merged.materials.extend(scene.materials);
+                merged.meshes.extend(scene.meshes);
+            }
+            Err(e) => log::warn!("Skipping model '{}': {}", path, e),
+        }
+    }
+
+    if merged.meshes.is_empty() {
+        log::info!("No models loaded from scene — using builtin cube");
+        merged = builtin_cube();
+        mesh_offsets = vec![0];
+    }
+
+    Ok((merged, mesh_offsets))
 }
 
 // ---------------------------------------------------------------------------
@@ -251,12 +324,18 @@ pub fn builtin_cube() -> SceneData {
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
 
+    // AABB of the unit cube: ±0.5 on each axis.
+    let aabb_min = Vec3::splat(-0.5);
+    let aabb_max = Vec3::splat(0.5);
+
     SceneData {
         meshes: vec![MeshData {
             vertices,
             indices,
             transform: Mat4::IDENTITY,
             material_index: None,
+            aabb_min,
+            aabb_max,
         }],
         textures: vec![],
         materials: vec![],

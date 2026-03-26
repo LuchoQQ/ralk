@@ -12,9 +12,20 @@ glam = { version = "0.29", features = ["bytemuck"] }
 bytemuck = { version = "1.16", features = ["derive"] }
 gpu-allocator = { version = "0.27", features = ["vulkan"] }
 gltf = { version = "1", features = ["utils"] }
+hecs = "0.10"
 log = "0.4"
 env_logger = "0.11"
 anyhow = "1.0"
+egui = "0.33"
+egui-winit = "0.33"
+egui-ash-renderer = { version = "0.11", features = ["dynamic-rendering"] }
+notify = "7"
+shaderc = "0.8"
+gilrs = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rapier3d = { version = "0.22", features = ["simd-stable"] }
+rodio = "0.19"
 
 [build-dependencies]
 shaderc = "0.8"

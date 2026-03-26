@@ -80,17 +80,23 @@ impl Camera3D {
 
     /// Apply input accumulated this frame, advance camera state.
     pub fn update(&mut self, input: &InputState, dt: f32) {
-        // Mouse look
+        if input.ui_captured {
+            return;
+        }
+
+        // Mouse look (accumulated delta this frame).
         self.yaw += input.mouse_delta.x * self.mouse_sensitivity;
         self.pitch = (self.pitch + input.mouse_delta.y * self.mouse_sensitivity)
             .clamp(-89.0f32.to_radians(), 89.0f32.to_radians());
 
-        // WASD movement relative to look direction
-        let speed = if input.sprint {
-            self.move_speed * 3.0
-        } else {
-            self.move_speed
-        };
+        // Gamepad right-stick look (scaled to feel similar to mouse at moderate sensitivity).
+        const GAMEPAD_LOOK_SPEED: f32 = 2.0; // radians per second per unit
+        self.yaw += input.gamepad_look.x * GAMEPAD_LOOK_SPEED * dt;
+        self.pitch = (self.pitch + input.gamepad_look.y * GAMEPAD_LOOK_SPEED * dt)
+            .clamp(-89.0f32.to_radians(), 89.0f32.to_radians());
+
+        // WASD movement relative to look direction.
+        let speed = if input.sprint { self.move_speed * 3.0 } else { self.move_speed };
         let forward = self.forward();
         let right = self.right();
 
@@ -106,5 +112,9 @@ impl Camera3D {
         if input.right {
             self.position += right * speed * dt;
         }
+
+        // Gamepad left-stick movement (X = strafe, Y = forward/back; gilrs Y is inverted).
+        self.position += forward * (-input.gamepad_move.y) * speed * dt;
+        self.position += right   *  input.gamepad_move.x  * speed * dt;
     }
 }

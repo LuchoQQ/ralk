@@ -1,0 +1,29 @@
+{
+  "models": [
+    "assets/DamagedHelmet.glb",
+    "assets/DamagedHelmet.glb",
+    "assets/DamagedHelmet.glb",
+    "assets/DamagedHelmet.glb",
+    "assets/DamagedHelmet.glb"
+  ],
+  "entities": [
+    { "mesh_index": 0, "material_set_index": 0, "position": [-6.0, 0.0, 0.0], "rotation": [0.0, 0.0, 0.0, 1.0], "scale": [1.0, 1.0, 1.0] },
+    { "mesh_index": 1, "material_set_index": 1, "position": [-3.0, 0.0, 0.0], "rotation": [0.0, 0.0, 0.0, 1.0], "scale": [1.0, 1.0, 1.0] },
+    { "mesh_index": 2, "material_set_index": 2, "position": [0.0,  0.0, 0.0], "rotation": [0.0, 0.0, 0.0, 1.0], "scale": [1.0, 1.0, 1.0] },
+    { "mesh_index": 3, "material_set_index": 3, "position": [3.0,  0.0, 0.0], "rotation": [0.0, 0.0, 0.0, 1.0], "scale": [1.0, 1.0, 1.0] },
+    { "mesh_index": 4, "material_set_index": 4, "position": [6.0,  0.0, 0.0], "rotation": [0.0, 0.0, 0.0, 1.0], "scale": [1.0, 1.0, 1.0] }
+  ],
+  "directional_light": {
+    "direction": [0.4, -1.0, -0.6],
+    "color": [1.0, 1.0, 1.0],
+    "intensity": 1.2
+  },
+  "point_lights": [
+    {
+      "position": [0.0, 3.0, 2.0],
+      "color": [1.0, 0.9, 0.7],
+      "intensity": 3.0,
+      "radius": 10.0
+    }
+  ]
+}

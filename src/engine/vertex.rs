@@ -1,6 +1,32 @@
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
 
+/// Vertex type used by the wireframe debug pipeline (position-only, 12 bytes).
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Pod, Zeroable)]
+pub struct WireframeVertex {
+    pub position: [f32; 3],
+}
+
+impl WireframeVertex {
+    pub fn binding_description() -> vk::VertexInputBindingDescription {
+        vk::VertexInputBindingDescription {
+            binding: 0,
+            stride: std::mem::size_of::<Self>() as u32, // 12
+            input_rate: vk::VertexInputRate::VERTEX,
+        }
+    }
+
+    pub fn attribute_descriptions() -> [vk::VertexInputAttributeDescription; 1] {
+        [vk::VertexInputAttributeDescription {
+            location: 0,
+            binding: 0,
+            format: vk::Format::R32G32B32_SFLOAT,
+            offset: 0,
+        }]
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Pod, Zeroable)]
 pub struct Vertex {

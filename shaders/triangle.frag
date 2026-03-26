@@ -8,7 +8,7 @@ layout(location = 4) in vec3 fragN;
 
 layout(location = 0) out vec4 outColor;
 
-// Set 0: lighting UBO + shadow map
+// Set 0: lighting UBO, shadow map, IBL maps
 layout(set = 0, binding = 0) uniform LightingUBO {
     vec4 dirLightDir;      // xyz = toward-light direction (normalized), w unused
     vec4 dirLightColor;    // xyz = color, w = intensity
@@ -18,7 +18,10 @@ layout(set = 0, binding = 0) uniform LightingUBO {
     mat4 lightMvp;         // light view-projection (applied to world-space positions)
 } lights;
 
-layout(set = 0, binding = 1) uniform sampler2D shadowMap;
+layout(set = 0, binding = 1) uniform sampler2D   shadowMap;
+layout(set = 0, binding = 2) uniform samplerCube irradianceMap;   // diffuse IBL
+layout(set = 0, binding = 3) uniform samplerCube prefilteredMap;  // specular IBL (mipped)
+layout(set = 0, binding = 4) uniform sampler2D   brdfLut;         // split-sum BRDF LUT
 
 // Set 1: material textures
 layout(set = 1, binding = 0) uniform sampler2D albedoMap;           // R8G8B8A8_SRGB
@@ -90,11 +93,24 @@ void main() {
 
     vec3 V = normalize(lights.cameraPos.xyz - fragWorldPos);
 
-    // Ambient (constant approximation — no IBL in Milestone 1)
-    vec3 F0  = mix(vec3(0.04), albedo, metallic);
-    vec3 kS  = F_Schlick(max(dot(N, V), 0.0), F0);
-    vec3 kD  = (1.0 - kS) * (1.0 - metallic);
-    vec3 color = kD * albedo * 0.03;
+    // IBL ambient — split-sum approximation (diffuse irradiance + specular prefiltered env).
+    vec3  F0     = mix(vec3(0.04), albedo, metallic);
+    float NdotV  = max(dot(N, V), 0.0);
+    vec3  F_amb  = F_Schlick(NdotV, F0);
+    vec3  kD_ibl = (1.0 - F_amb) * (1.0 - metallic);
+
+    // Diffuse: irradiance from preconvolved env (stores mean radiance over cosine hemisphere).
+    vec3 irradiance  = texture(irradianceMap, N).rgb;
+    vec3 diffuse_ibl = kD_ibl * albedo * irradiance;
+
+    // Specular: prefiltered env (mip = roughness * max_mip) + BRDF scale/bias from LUT.
+    vec3  R               = reflect(-V, N);
+    const float MAX_MIP   = float(4); // PREFILTERED_MIP_LEVELS - 1 = 5 - 1
+    vec3  prefColor       = textureLod(prefilteredMap, R, roughness * MAX_MIP).rgb;
+    vec2  brdf            = texture(brdfLut, vec2(NdotV, roughness)).rg;
+    vec3  specular_ibl    = prefColor * (F_amb * brdf.x + brdf.y);
+
+    vec3 color = diffuse_ibl + specular_ibl;
 
     // Shadow: project world position into light clip space (orthographic).
     // lightMvp is view-projection only; fragWorldPos is already in world space.
@@ -137,7 +153,15 @@ void main() {
                                         lights.pointLightColor.xyz, lights.pointLightColor.w,
                                         albedo, metallic, roughness);
 
-    // Reinhard tone mapping
-    color    = color / (color + vec3(1.0));
+    // Tone mapping: Reinhard (mode 0) or ACES Filmic (mode 1).
+    // Mode is passed via cameraPos.w (unused in lighting; set per-frame by the app).
+    if (lights.cameraPos.w >= 0.5) {
+        // ACES Filmic (Hill approximation)
+        const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+        color = clamp((color * (a * color + b)) / (color * (c * color + d) + e), 0.0, 1.0);
+    } else {
+        // Reinhard
+        color = color / (color + vec3(1.0));
+    }
     outColor = vec4(color, 1.0);
 }

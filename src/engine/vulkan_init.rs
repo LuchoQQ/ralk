@@ -3,15 +3,17 @@ use std::ffi::{c_char, CStr};
 use anyhow::{Context, Result};
 use ash::vk;
 use bytemuck;
+use egui_ash_renderer::{DynamicRendering, Options, Renderer as EguiRenderer};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
 
 use gpu_allocator::MemoryLocation;
 
 use super::gpu_resources::{BufferHandle, GpuMesh, GpuResourceManager, ImageHandle};
+use super::render_graph::{RenderGraph, ResourceAccess};
 use super::vertex::Vertex;
 use crate::asset::SceneData;
-use crate::scene::{compute_light_mvp, LightingState, LightingUbo};
+use crate::scene::LightingUbo;
 
 /// Push constant layout (128 bytes = Vulkan minimum).
 /// bytes  0..64 = MVP matrix, bytes 64..128 = model matrix.
@@ -24,12 +26,10 @@ struct MeshPushConstants {
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
-/// A mesh instance: GPU geometry + world transform + pre-resolved material descriptor set.
-struct SceneInstance {
-    mesh: GpuMesh,
-    model: glam::Mat4,
-    material_set: vk::DescriptorSet,
-}
+/// HDR render target format for the main pass and bloom chain.
+pub const HDR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+/// Number of bloom downsample/upsample levels (half-res to 1/32-res).
+const BLOOM_LEVELS: usize = 5;
 
 #[allow(dead_code)] // entry keeps Vulkan loaded; queue_family_index used in later phases
 pub struct VulkanContext {
@@ -44,7 +44,8 @@ pub struct VulkanContext {
     graphics_queue: vk::Queue,
     queue_family_index: u32,
     resource_manager: Option<GpuResourceManager>,
-    instances: Vec<SceneInstance>,
+    gpu_meshes: Vec<GpuMesh>,
+    material_sets: Vec<vk::DescriptorSet>,
     // Lighting (set 0)
     lighting_set_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
@@ -64,6 +65,22 @@ pub struct VulkanContext {
     shadow_sampler: vk::Sampler,
     shadow_pipeline_layout: vk::PipelineLayout,
     shadow_pipeline: vk::Pipeline,
+    // IBL images
+    ibl_sampler: vk::Sampler,
+    skybox_image: ImageHandle,
+    irradiance_image: ImageHandle,
+    prefiltered_image: ImageHandle,
+    brdf_lut_image: ImageHandle,
+    // Skybox pipeline + descriptor set (static, not per-frame)
+    skybox_set_layout: vk::DescriptorSetLayout,
+    skybox_descriptor_pool: vk::DescriptorPool,
+    skybox_descriptor_set: vk::DescriptorSet,
+    skybox_pipeline_layout: vk::PipelineLayout,
+    skybox_pipeline: vk::Pipeline,
+    wireframe_pipeline_layout: vk::PipelineLayout,
+    wireframe_pipeline: vk::Pipeline,
+    wireframe_vertex_buffers: Vec<BufferHandle>,
+    gizmo_vertex_buffers: Vec<BufferHandle>,
     pipeline_layout: vk::PipelineLayout,
     graphics_pipeline: vk::Pipeline,
     swapchain_loader: ash::khr::swapchain::Device,
@@ -81,6 +98,34 @@ pub struct VulkanContext {
     current_frame: usize,
     acquire_semaphore_index: usize,
     pub framebuffer_resized: bool,
+    // MSAA
+    msaa_samples: vk::SampleCountFlags,
+    msaa_max: vk::SampleCountFlags,
+    msaa_color: Option<ImageHandle>,
+    msaa_depth: Option<ImageHandle>,
+    // HDR render target (main pass output, input to bloom/composite)
+    hdr_color: ImageHandle,
+    // Bloom post-processing
+    bloom_sampler: vk::Sampler,
+    bloom_images: Vec<ImageHandle>,          // BLOOM_LEVELS images, half-res to 1/32-res
+    bloom_extents: Vec<vk::Extent2D>,        // extents for each bloom level
+    bloom_set_layout: vk::DescriptorSetLayout,
+    bloom_descriptor_pool: vk::DescriptorPool,
+    bloom_downsample_sets: Vec<vk::DescriptorSet>,  // [BLOOM_LEVELS]: ds[0]=hdr, ds[i]=bloom[i-1]
+    bloom_upsample_sets: Vec<vk::DescriptorSet>,    // [BLOOM_LEVELS-1]: us[i] reads bloom[i+1]
+    composite_set_layout: vk::DescriptorSetLayout,
+    composite_descriptor_pool: vk::DescriptorPool,
+    composite_descriptor_set: vk::DescriptorSet,
+    bloom_downsample_pipeline_layout: vk::PipelineLayout,
+    bloom_downsample_pipeline: vk::Pipeline,
+    bloom_upsample_pipeline_layout: vk::PipelineLayout,
+    bloom_upsample_pipeline: vk::Pipeline,
+    composite_pipeline_layout: vk::PipelineLayout,
+    composite_pipeline: vk::Pipeline,
+    // egui renderer (Option so we can take+drop it before device destruction)
+    egui_renderer: Option<EguiRenderer>,
+    // Per-frame-in-flight lists of egui texture IDs to free after the GPU finishes.
+    egui_textures_to_free: [Vec<egui::TextureId>; MAX_FRAMES_IN_FLIGHT],
 }
 
 // ---------------------------------------------------------------------------
@@ -605,9 +650,68 @@ fn depth_aspect(format: vk::Format) -> vk::ImageAspectFlags {
     }
 }
 
+/// Query the max MSAA sample count supported for both color and depth attachments.
+fn max_msaa_samples(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> vk::SampleCountFlags {
+    // SAFETY: instance and physical_device are valid.
+    let props = unsafe { instance.get_physical_device_properties(physical_device) };
+    let color_depth = props.limits.framebuffer_color_sample_counts
+        & props.limits.framebuffer_depth_sample_counts;
+    for &candidate in &[
+        vk::SampleCountFlags::TYPE_8,
+        vk::SampleCountFlags::TYPE_4,
+        vk::SampleCountFlags::TYPE_2,
+    ] {
+        if color_depth.contains(candidate) {
+            return candidate;
+        }
+    }
+    vk::SampleCountFlags::TYPE_1
+}
+
 // ---------------------------------------------------------------------------
 // VulkanContext — public API
 // ---------------------------------------------------------------------------
+
+/// Write a single material descriptor set (3 COMBINED_IMAGE_SAMPLER bindings).
+/// Shared by `VulkanContext::new` and `VulkanContext::reload_scene`.
+fn write_material_set(
+    device: &ash::Device,
+    set: vk::DescriptorSet,
+    sampler: vk::Sampler,
+    rm: &super::gpu_resources::GpuResourceManager,
+    albedo: super::gpu_resources::ImageHandle,
+    normal: super::gpu_resources::ImageHandle,
+    mr: super::gpu_resources::ImageHandle,
+) {
+    let image_infos = [
+        vk::DescriptorImageInfo::default()
+            .sampler(sampler)
+            .image_view(rm.get_image_view(albedo))
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+        vk::DescriptorImageInfo::default()
+            .sampler(sampler)
+            .image_view(rm.get_image_view(normal))
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+        vk::DescriptorImageInfo::default()
+            .sampler(sampler)
+            .image_view(rm.get_image_view(mr))
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+    ];
+    let writes: Vec<vk::WriteDescriptorSet> = (0u32..3)
+        .map(|binding| {
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(binding)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&image_infos[binding as usize..binding as usize + 1])
+        })
+        .collect();
+    // SAFETY: set, image views, and sampler are all valid.
+    unsafe { device.update_descriptor_sets(&writes, &[]) };
+}
 
 impl VulkanContext {
     pub fn new(window: &Window, scene_data: &SceneData) -> Result<Self> {
@@ -649,7 +753,19 @@ impl VulkanContext {
             queue_family_index,
         )?;
 
-        // --- Shared sampler (linear, repeat, single mip) ---
+        // Query MSAA support — choose 4x if available, else 2x, else off.
+        let msaa_max = max_msaa_samples(&instance, physical_device);
+        let msaa_samples = if msaa_max.contains(vk::SampleCountFlags::TYPE_4) {
+            vk::SampleCountFlags::TYPE_4
+        } else if msaa_max.contains(vk::SampleCountFlags::TYPE_2) {
+            vk::SampleCountFlags::TYPE_2
+        } else {
+            vk::SampleCountFlags::TYPE_1
+        };
+        log::info!("MSAA: {:?} selected (max supported: {:?})", msaa_samples, msaa_max);
+
+        // --- Shared sampler (linear, repeat, all mip levels) ---
+        // max_lod=1000.0 ensures all generated mip levels are accessible.
         let sampler_info = vk::SamplerCreateInfo::default()
             .mag_filter(vk::Filter::LINEAR)
             .min_filter(vk::Filter::LINEAR)
@@ -659,7 +775,7 @@ impl VulkanContext {
             .address_mode_w(vk::SamplerAddressMode::REPEAT)
             .anisotropy_enable(false)
             .min_lod(0.0)
-            .max_lod(0.0);
+            .max_lod(1000.0); // covers all mip levels for any texture size
         // SAFETY: device is valid, sampler_info is well-formed.
         let sampler = unsafe { device.create_sampler(&sampler_info, None) }
             .context("Failed to create sampler")?;
@@ -736,9 +852,57 @@ impl VulkanContext {
             .context("Failed to create shadow sampler")?;
         log::info!("Shadow map created (2048×2048, {:?})", depth_format);
 
+        // --- IBL precomputation (CPU) + GPU upload ---
+        let env = super::skybox::load_environment("assets/sky.hdr");
+        let ibl = super::skybox::precompute_ibl(&env);
+
+        // Sampler shared by all IBL images: linear, clamp-to-edge, mips 0..max_prefiltered.
+        let ibl_sampler_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .min_lod(0.0)
+            .max_lod((super::skybox::PREFILTERED_MIP_LEVELS - 1) as f32);
+        // SAFETY: device is valid.
+        let ibl_sampler = unsafe { device.create_sampler(&ibl_sampler_info, None) }
+            .context("Failed to create IBL sampler")?;
+
+        let skybox_mip_data = vec![ibl.skybox_faces];
+        let skybox_image = resource_manager.upload_cubemap_mips(
+            &skybox_mip_data,
+            super::skybox::SKYBOX_FACE_SIZE,
+            vk::Format::R16G16B16A16_SFLOAT,
+        )?;
+
+        let irr_mip_data = vec![ibl.irr_faces];
+        let irradiance_image = resource_manager.upload_cubemap_mips(
+            &irr_mip_data,
+            super::skybox::IRRADIANCE_FACE_SIZE,
+            vk::Format::R16G16B16A16_SFLOAT,
+        )?;
+
+        let prefiltered_image = resource_manager.upload_cubemap_mips(
+            &ibl.pre_faces,
+            super::skybox::PREFILTERED_FACE_SIZE,
+            vk::Format::R16G16B16A16_SFLOAT,
+        )?;
+
+        let brdf_lut_image = resource_manager.upload_image_raw(
+            &ibl.brdf_lut,
+            super::skybox::BRDF_LUT_SIZE,
+            super::skybox::BRDF_LUT_SIZE,
+            vk::Format::R16G16_SFLOAT,
+        )?;
+        log::info!("IBL images uploaded to GPU");
+
         // --- Descriptor set layouts ---
         let lighting_set_layout =
             super::pipeline::create_lighting_descriptor_set_layout(&device)?;
+        let skybox_set_layout =
+            super::pipeline::create_skybox_descriptor_set_layout(&device)?;
         let material_set_layout =
             super::pipeline::create_material_descriptor_set_layout(&device)?;
 
@@ -747,20 +911,64 @@ impl VulkanContext {
         let (pipeline_layout, graphics_pipeline) =
             super::pipeline::create_graphics_pipeline(
                 &device,
-                swapchain_format,
+                super::pipeline::VERT_SPV,
+                super::pipeline::FRAG_SPV,
+                HDR_FORMAT,
                 depth_format,
                 &binding_descriptions,
                 &attribute_descriptions,
                 lighting_set_layout,
                 material_set_layout,
+                msaa_samples,
             )?;
         let (shadow_pipeline_layout, shadow_pipeline) =
             super::pipeline::create_shadow_pipeline(
                 &device,
+                super::pipeline::SHADOW_VERT_SPV,
+                super::pipeline::SHADOW_FRAG_SPV,
                 depth_format,
                 &binding_descriptions,
                 &attribute_descriptions,
             )?;
+        let (skybox_pipeline_layout, skybox_pipeline) =
+            super::pipeline::create_skybox_pipeline(
+                &device,
+                super::pipeline::SKYBOX_VERT_SPV,
+                super::pipeline::SKYBOX_FRAG_SPV,
+                HDR_FORMAT,
+                depth_format,
+                skybox_set_layout,
+                msaa_samples,
+            )?;
+
+        // Wireframe debug pipeline (LINE_LIST, no depth test).
+        let wf_binding = [super::vertex::WireframeVertex::binding_description()];
+        let wf_attributes = super::vertex::WireframeVertex::attribute_descriptions();
+        let (wireframe_pipeline_layout, wireframe_pipeline) =
+            super::pipeline::create_wireframe_pipeline(&device, swapchain_format, &wf_binding, &wf_attributes)?;
+
+        // Per-frame wireframe vertex buffers (CpuToGpu, 64 KiB each ≈ 5461 vertices).
+        const WIREFRAME_BUFFER_SIZE: u64 = 64 * 1024;
+        let mut wireframe_vertex_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
+        for _ in 0..MAX_FRAMES_IN_FLIGHT {
+            let buf = resource_manager.create_buffer(
+                WIREFRAME_BUFFER_SIZE,
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+                MemoryLocation::CpuToGpu,
+            )?;
+            wireframe_vertex_buffers.push(buf);
+        }
+
+        // Per-frame gizmo vertex buffers (8 KiB each — gizmo geometry is tiny).
+        let mut gizmo_vertex_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
+        for _ in 0..MAX_FRAMES_IN_FLIGHT {
+            let buf = resource_manager.create_buffer(
+                8 * 1024,
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+                MemoryLocation::CpuToGpu,
+            )?;
+            gizmo_vertex_buffers.push(buf);
+        }
 
         // UBO buffers: one per frame, HOST_VISIBLE so we can update every frame.
         let ubo_size = std::mem::size_of::<LightingUbo>() as u64;
@@ -774,7 +982,8 @@ impl VulkanContext {
             ubo_buffers.push(buf);
         }
 
-        // --- Lighting descriptor pool (set 0): UBO (binding 0) + shadow sampler (binding 1) ---
+        // --- Lighting descriptor pool (set 0): UBO + 4 image samplers per frame ---
+        // Bindings: 0=UBO, 1=shadow, 2=irradiance, 3=prefiltered, 4=BRDF LUT
         let lighting_pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
@@ -782,7 +991,7 @@ impl VulkanContext {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                descriptor_count: MAX_FRAMES_IN_FLIGHT as u32,
+                descriptor_count: (MAX_FRAMES_IN_FLIGHT * 4) as u32,
             },
         ];
         let lighting_pool_info = vk::DescriptorPoolCreateInfo::default()
@@ -803,36 +1012,58 @@ impl VulkanContext {
             unsafe { device.allocate_descriptor_sets(&lighting_alloc_info) }
                 .context("Failed to allocate lighting descriptor sets")?;
 
-        // Point each descriptor set at its UBO buffer (binding 0) and shadow map (binding 1).
-        let shadow_view = resource_manager.get_image_view(shadow_map);
+        // Point each descriptor set at its UBO + all image samplers.
+        // Bindings: 0=UBO, 1=shadow, 2=irradiance, 3=prefiltered, 4=BRDF LUT.
+        // IBL images are static (same view for all frames); only the UBO changes per frame.
+        let shadow_view      = resource_manager.get_image_view(shadow_map);
+        let irr_view         = resource_manager.get_image_view(irradiance_image);
+        let pre_view         = resource_manager.get_image_view(prefiltered_image);
+        let brdf_view        = resource_manager.get_image_view(brdf_lut_image);
         for (i, &set) in descriptor_sets.iter().enumerate() {
             let buffer = resource_manager.get_buffer(ubo_buffers[i]);
-            let buffer_info = [vk::DescriptorBufferInfo {
-                buffer,
-                offset: 0,
-                range: ubo_size,
+            let buffer_info = [vk::DescriptorBufferInfo { buffer, offset: 0, range: ubo_size }];
+            let shadow_info = [vk::DescriptorImageInfo {
+                sampler: shadow_sampler, image_view: shadow_view,
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             }];
-            let shadow_image_info = [vk::DescriptorImageInfo {
-                sampler: shadow_sampler,
-                image_view: shadow_view,
+            let irr_info = [vk::DescriptorImageInfo {
+                sampler: ibl_sampler, image_view: irr_view,
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            }];
+            let pre_info = [vk::DescriptorImageInfo {
+                sampler: ibl_sampler, image_view: pre_view,
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            }];
+            let brdf_info = [vk::DescriptorImageInfo {
+                sampler: ibl_sampler, image_view: brdf_view,
                 image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             }];
             let writes = [
                 vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(0)
+                    .dst_set(set).dst_binding(0)
                     .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                     .buffer_info(&buffer_info),
                 vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(1)
+                    .dst_set(set).dst_binding(1)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .image_info(&shadow_image_info),
+                    .image_info(&shadow_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set).dst_binding(2)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&irr_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set).dst_binding(3)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&pre_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set).dst_binding(4)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&brdf_info),
             ];
-            // SAFETY: set, buffer, image view, and sampler are valid.
+            // SAFETY: set, buffer, image views, and samplers are all valid.
             unsafe { device.update_descriptor_sets(&writes, &[]) };
         }
-        log::info!("Lighting descriptor sets created ({MAX_FRAMES_IN_FLIGHT} frames)");
+        log::info!("Lighting descriptor sets created ({MAX_FRAMES_IN_FLIGHT} frames, 5 bindings each)");
 
         // --- Material descriptor pool (set 1): one set per material + 1 default ---
         // Each set has 3 COMBINED_IMAGE_SAMPLER bindings.
@@ -863,87 +1094,298 @@ impl VulkanContext {
             idx.and_then(|i| scene_textures.get(i).copied()).unwrap_or(default)
         };
 
-        // Write descriptor sets for each glTF material.
+        // Write descriptor sets for each glTF material (shared helper).
         for (i, mat) in scene_data.materials.iter().enumerate() {
-            let albedo_view = resource_manager
-                .get_image_view(resolve_tex(mat.albedo_tex, default_albedo));
-            let normal_view = resource_manager
-                .get_image_view(resolve_tex(mat.normal_tex, default_normal));
-            let mr_view = resource_manager
-                .get_image_view(resolve_tex(mat.metallic_roughness_tex, default_mr));
-
-            let image_infos = [
-                vk::DescriptorImageInfo::default()
-                    .sampler(sampler)
-                    .image_view(albedo_view)
-                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-                vk::DescriptorImageInfo::default()
-                    .sampler(sampler)
-                    .image_view(normal_view)
-                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-                vk::DescriptorImageInfo::default()
-                    .sampler(sampler)
-                    .image_view(mr_view)
-                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-            ];
-            let writes: Vec<vk::WriteDescriptorSet> = (0u32..3)
-                .map(|binding| {
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(material_sets[i])
-                        .dst_binding(binding)
-                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                        .image_info(&image_infos[binding as usize..binding as usize + 1])
-                })
-                .collect();
-            // SAFETY: set, image views, and sampler are valid.
-            unsafe { device.update_descriptor_sets(&writes, &[]) };
+            write_material_set(
+                &device, material_sets[i], sampler, &resource_manager,
+                resolve_tex(mat.albedo_tex, default_albedo),
+                resolve_tex(mat.normal_tex, default_normal),
+                resolve_tex(mat.metallic_roughness_tex, default_mr),
+            );
         }
 
         // Write the default material set (last one) — all-default textures.
         let default_idx = num_material_sets - 1;
-        {
-            let image_infos = [
-                vk::DescriptorImageInfo::default()
-                    .sampler(sampler)
-                    .image_view(resource_manager.get_image_view(default_albedo))
-                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-                vk::DescriptorImageInfo::default()
-                    .sampler(sampler)
-                    .image_view(resource_manager.get_image_view(default_normal))
-                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-                vk::DescriptorImageInfo::default()
-                    .sampler(sampler)
-                    .image_view(resource_manager.get_image_view(default_mr))
-                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-            ];
-            let writes: Vec<vk::WriteDescriptorSet> = (0u32..3)
-                .map(|binding| {
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(material_sets[default_idx])
-                        .dst_binding(binding)
-                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                        .image_info(&image_infos[binding as usize..binding as usize + 1])
-                })
-                .collect();
-            // SAFETY: default set, image views, and sampler are valid.
-            unsafe { device.update_descriptor_sets(&writes, &[]) };
-        }
+        write_material_set(
+            &device, material_sets[default_idx], sampler, &resource_manager,
+            default_albedo, default_normal, default_mr,
+        );
         log::info!("Material descriptor sets created ({} materials + 1 default)", scene_data.materials.len());
 
-        // --- Upload meshes, resolve material descriptor sets per instance ---
-        let default_material_set = material_sets[default_idx];
-        let mut instances: Vec<SceneInstance> = Vec::with_capacity(scene_data.meshes.len());
+        // --- Skybox descriptor pool + set (1 COMBINED_IMAGE_SAMPLER for the skybox cubemap) ---
+        let skybox_pool_sizes = [vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            descriptor_count: 1,
+        }];
+        let skybox_pool_info = vk::DescriptorPoolCreateInfo::default()
+            .pool_sizes(&skybox_pool_sizes)
+            .max_sets(1);
+        // SAFETY: device is valid.
+        let skybox_descriptor_pool = unsafe { device.create_descriptor_pool(&skybox_pool_info, None) }
+            .context("Failed to create skybox descriptor pool")?;
+
+        let skybox_layouts = [skybox_set_layout];
+        let skybox_alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(skybox_descriptor_pool)
+            .set_layouts(&skybox_layouts);
+        // SAFETY: pool and layout are valid.
+        let skybox_sets = unsafe { device.allocate_descriptor_sets(&skybox_alloc_info) }
+            .context("Failed to allocate skybox descriptor set")?;
+        let skybox_descriptor_set = skybox_sets[0];
+
+        let skybox_cubemap_info = [vk::DescriptorImageInfo {
+            sampler: ibl_sampler,
+            image_view: resource_manager.get_image_view(skybox_image),
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        }];
+        let skybox_write = [vk::WriteDescriptorSet::default()
+            .dst_set(skybox_descriptor_set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&skybox_cubemap_info)];
+        // SAFETY: set, image view, and sampler are valid.
+        unsafe { device.update_descriptor_sets(&skybox_write, &[]) };
+        log::info!("Skybox descriptor set created");
+
+        // --- Upload meshes (transforms and per-draw selection come from ECS) ---
+        let mut gpu_meshes: Vec<GpuMesh> = Vec::with_capacity(scene_data.meshes.len());
         for data in &scene_data.meshes {
             let mesh = resource_manager.upload_mesh(&data.vertices, &data.indices)?;
-            let material_set = data.material_index
-                .and_then(|i| material_sets.get(i).copied())
-                .unwrap_or(default_material_set);
-            instances.push(SceneInstance { mesh, model: data.transform, material_set });
+            gpu_meshes.push(mesh);
         }
         let (command_pool, command_buffers) =
             create_command_pool_and_buffers(&device, queue_family_index)?;
         let (image_available_semaphores, render_finished_semaphores, in_flight_fences) =
             create_sync_objects(&device, swapchain_images.len())?;
+
+        // --- egui renderer ---
+        let egui_renderer = EguiRenderer::with_default_allocator(
+            &instance,
+            physical_device,
+            device.clone(),
+            DynamicRendering {
+                color_attachment_format: swapchain_format,
+                depth_attachment_format: None,
+            },
+            Options {
+                in_flight_frames: MAX_FRAMES_IN_FLIGHT,
+                ..Default::default()
+            },
+        )
+        .context("Failed to create egui renderer")?;
+        log::info!("egui renderer created");
+
+        // --- MSAA images (none for TYPE_1) ---
+        // Use HDR_FORMAT for the MSAA color image since the main pass renders to hdr_color.
+        let (msaa_color, msaa_depth) = if msaa_samples != vk::SampleCountFlags::TYPE_1 {
+            let color = resource_manager.create_msaa_image(
+                swapchain_extent.width,
+                swapchain_extent.height,
+                HDR_FORMAT,
+                msaa_samples,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                vk::ImageAspectFlags::COLOR,
+            )?;
+            let depth = resource_manager.create_msaa_image(
+                swapchain_extent.width,
+                swapchain_extent.height,
+                depth_format,
+                msaa_samples,
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+                depth_aspect(depth_format),
+            )?;
+            log::info!(
+                "MSAA images created ({}×{}, {:?})",
+                swapchain_extent.width, swapchain_extent.height, msaa_samples
+            );
+            (Some(color), Some(depth))
+        } else {
+            (None, None)
+        };
+
+        // -----------------------------------------------------------------------
+        // HDR color target + bloom chain
+        // -----------------------------------------------------------------------
+
+        // --- HDR color target (main pass renders here, bloom+composite read from it) ---
+        let hdr_color = resource_manager.create_attachment_image(
+            swapchain_extent.width, swapchain_extent.height,
+            HDR_FORMAT,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            vk::ImageAspectFlags::COLOR,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::AccessFlags::SHADER_READ,
+        )?;
+
+        // --- Bloom sampler (linear, clamp to edge) ---
+        let bloom_sampler_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .max_lod(0.0);
+        // SAFETY: device is valid, sampler_info is well-formed.
+        let bloom_sampler = unsafe { device.create_sampler(&bloom_sampler_info, None) }
+            .context("Failed to create bloom sampler")?;
+
+        // --- Bloom chain images (BLOOM_LEVELS levels: half → 1/32 resolution) ---
+        let mut bloom_images: Vec<ImageHandle> = Vec::with_capacity(BLOOM_LEVELS);
+        let mut bloom_extents: Vec<vk::Extent2D> = Vec::with_capacity(BLOOM_LEVELS);
+        let mut w = swapchain_extent.width.max(2) / 2;
+        let mut h = swapchain_extent.height.max(2) / 2;
+        for _ in 0..BLOOM_LEVELS {
+            let img = resource_manager.create_attachment_image(
+                w, h,
+                HDR_FORMAT,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                vk::ImageAspectFlags::COLOR,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::AccessFlags::SHADER_READ,
+            )?;
+            bloom_images.push(img);
+            bloom_extents.push(vk::Extent2D { width: w, height: h });
+            w = (w / 2).max(1);
+            h = (h / 2).max(1);
+        }
+        log::info!("HDR color target + {} bloom levels created", BLOOM_LEVELS);
+
+        // --- Bloom descriptor set layout (1 sampler) ---
+        let bloom_set_layout = super::pipeline::create_bloom_descriptor_set_layout(&device)?;
+        // --- Composite descriptor set layout (2 samplers) ---
+        let composite_set_layout = super::pipeline::create_composite_descriptor_set_layout(&device)?;
+
+        // --- Bloom + composite descriptor pool ---
+        // BLOOM_LEVELS ds-sets + (BLOOM_LEVELS-1) up-sets + 1 composite = 11 sets, max samplers.
+        let bloom_pool_sizes = [vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            descriptor_count: (BLOOM_LEVELS * 2 + 2) as u32,
+        }];
+        let bloom_pool_info = vk::DescriptorPoolCreateInfo::default()
+            .max_sets((BLOOM_LEVELS * 2 + 1) as u32)
+            .pool_sizes(&bloom_pool_sizes);
+        // SAFETY: device is valid.
+        let bloom_descriptor_pool =
+            unsafe { device.create_descriptor_pool(&bloom_pool_info, None) }
+                .context("Failed to create bloom descriptor pool")?;
+        // composite_descriptor_pool shares the same pool — composite set is allocated from it too.
+        let composite_descriptor_pool = bloom_descriptor_pool;
+
+        // --- Allocate bloom downsample sets (BLOOM_LEVELS sets, bloom_set_layout) ---
+        let down_layouts: Vec<vk::DescriptorSetLayout> = vec![bloom_set_layout; BLOOM_LEVELS];
+        let down_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(bloom_descriptor_pool)
+            .set_layouts(&down_layouts);
+        // SAFETY: pool and layout are valid.
+        let bloom_downsample_sets = unsafe { device.allocate_descriptor_sets(&down_alloc) }
+            .context("Failed to allocate bloom downsample descriptor sets")?;
+
+        // --- Allocate bloom upsample sets (BLOOM_LEVELS-1 sets) ---
+        let up_layouts: Vec<vk::DescriptorSetLayout> = vec![bloom_set_layout; BLOOM_LEVELS - 1];
+        let up_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(bloom_descriptor_pool)
+            .set_layouts(&up_layouts);
+        // SAFETY: pool and layout are valid.
+        let bloom_upsample_sets = unsafe { device.allocate_descriptor_sets(&up_alloc) }
+            .context("Failed to allocate bloom upsample descriptor sets")?;
+
+        // --- Allocate composite descriptor set (1 set, composite_set_layout) ---
+        let comp_layouts = [composite_set_layout];
+        let comp_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(bloom_descriptor_pool)
+            .set_layouts(&comp_layouts);
+        // SAFETY: pool and layout are valid.
+        let composite_sets = unsafe { device.allocate_descriptor_sets(&comp_alloc) }
+            .context("Failed to allocate composite descriptor set")?;
+        let composite_descriptor_set = composite_sets[0];
+
+        // --- Write bloom downsample descriptor sets ---
+        // ds[0] reads hdr_color, ds[i] reads bloom_images[i-1]
+        for i in 0..BLOOM_LEVELS {
+            let img_view = if i == 0 {
+                resource_manager.get_image_view(hdr_color)
+            } else {
+                resource_manager.get_image_view(bloom_images[i - 1])
+            };
+            let info = [vk::DescriptorImageInfo {
+                sampler: bloom_sampler,
+                image_view: img_view,
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            }];
+            let write = [vk::WriteDescriptorSet::default()
+                .dst_set(bloom_downsample_sets[i])
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&info)];
+            // SAFETY: set, image view, and sampler are valid.
+            unsafe { device.update_descriptor_sets(&write, &[]) };
+        }
+
+        // --- Write bloom upsample descriptor sets ---
+        // us[i] reads bloom_images[i+1] (the smaller level)
+        for i in 0..(BLOOM_LEVELS - 1) {
+            let info = [vk::DescriptorImageInfo {
+                sampler: bloom_sampler,
+                image_view: resource_manager.get_image_view(bloom_images[i + 1]),
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            }];
+            let write = [vk::WriteDescriptorSet::default()
+                .dst_set(bloom_upsample_sets[i])
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&info)];
+            // SAFETY: set, image view, and sampler are valid.
+            unsafe { device.update_descriptor_sets(&write, &[]) };
+        }
+
+        // --- Write composite descriptor set ---
+        // binding 0 = hdr_color, binding 1 = bloom_images[0] (final bloom result)
+        let hdr_img_info = [vk::DescriptorImageInfo {
+            sampler: bloom_sampler,
+            image_view: resource_manager.get_image_view(hdr_color),
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        }];
+        let bloom_img_info = [vk::DescriptorImageInfo {
+            sampler: bloom_sampler,
+            image_view: resource_manager.get_image_view(bloom_images[0]),
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        }];
+        let comp_writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(composite_descriptor_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&hdr_img_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(composite_descriptor_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&bloom_img_info),
+        ];
+        // SAFETY: set, image views, and sampler are valid.
+        unsafe { device.update_descriptor_sets(&comp_writes, &[]) };
+        log::info!("Bloom descriptor sets written");
+
+        // --- Bloom pipelines ---
+        let (bloom_downsample_pipeline_layout, bloom_downsample_pipeline) =
+            super::pipeline::create_bloom_pipeline(
+                &device, bloom_set_layout, HDR_FORMAT,
+                super::pipeline::FULLSCREEN_VERT_SPV,
+                super::pipeline::BLOOM_DOWN_FRAG_SPV,
+            )?;
+        let (bloom_upsample_pipeline_layout, bloom_upsample_pipeline) =
+            super::pipeline::create_bloom_pipeline(
+                &device, bloom_set_layout, HDR_FORMAT,
+                super::pipeline::FULLSCREEN_VERT_SPV,
+                super::pipeline::BLOOM_UP_FRAG_SPV,
+            )?;
+        let (composite_pipeline_layout, composite_pipeline) =
+            super::pipeline::create_composite_pipeline(
+                &device, composite_set_layout, swapchain_format,
+            )?;
 
         Ok(Self {
             entry,
@@ -956,7 +1398,8 @@ impl VulkanContext {
             graphics_queue,
             queue_family_index,
             resource_manager: Some(resource_manager),
-            instances,
+            gpu_meshes,
+            material_sets,
             lighting_set_layout,
             descriptor_pool,
             descriptor_sets,
@@ -972,6 +1415,20 @@ impl VulkanContext {
             depth_format,
             shadow_map,
             shadow_sampler,
+            ibl_sampler,
+            skybox_image,
+            irradiance_image,
+            prefiltered_image,
+            brdf_lut_image,
+            skybox_set_layout,
+            skybox_descriptor_pool,
+            skybox_descriptor_set,
+            skybox_pipeline_layout,
+            skybox_pipeline,
+            wireframe_pipeline_layout,
+            wireframe_pipeline,
+            wireframe_vertex_buffers,
+            gizmo_vertex_buffers,
             shadow_pipeline_layout,
             shadow_pipeline,
             pipeline_layout,
@@ -991,6 +1448,29 @@ impl VulkanContext {
             current_frame: 0,
             acquire_semaphore_index: 0,
             framebuffer_resized: false,
+            msaa_samples,
+            msaa_max,
+            msaa_color,
+            msaa_depth,
+            hdr_color,
+            bloom_sampler,
+            bloom_images,
+            bloom_extents,
+            bloom_set_layout,
+            bloom_descriptor_pool,
+            bloom_downsample_sets,
+            bloom_upsample_sets,
+            composite_set_layout,
+            composite_descriptor_pool,
+            composite_descriptor_set,
+            bloom_downsample_pipeline_layout,
+            bloom_downsample_pipeline,
+            bloom_upsample_pipeline_layout,
+            bloom_upsample_pipeline,
+            composite_pipeline_layout,
+            composite_pipeline,
+            egui_renderer: Some(egui_renderer),
+            egui_textures_to_free: [Vec::new(), Vec::new()],
         })
     }
 
@@ -998,8 +1478,19 @@ impl VulkanContext {
         &mut self,
         window: &Window,
         view_proj: glam::Mat4,
-        camera_pos: glam::Vec3,
-        lights: &LightingState,
+        lighting_ubo: LightingUbo,
+        instances: &[(glam::Mat4, usize, usize)],
+        wireframe_lines: &[glam::Vec3],
+        show_wireframe: bool,
+        gizmo_verts: &[glam::Vec3],
+        gizmo_groups: &[(u32, u32, [f32; 4])],
+        egui_primitives: &[egui::ClippedPrimitive],
+        egui_textures_delta: egui::TexturesDelta,
+        egui_pixels_per_point: f32,
+        bloom_enabled: bool,
+        bloom_intensity: f32,
+        bloom_threshold: f32,
+        tone_aces: bool,
     ) -> Result<()> {
         let size = window.inner_size();
         if size.width == 0 || size.height == 0 {
@@ -1019,6 +1510,20 @@ impl VulkanContext {
             self.device
                 .wait_for_fences(&[self.in_flight_fences[self.current_frame]], true, u64::MAX)?;
         }
+
+        // Free egui textures from the previous use of this frame slot (GPU is done with them).
+        if let Some(ref mut renderer) = self.egui_renderer {
+            let to_free = std::mem::take(&mut self.egui_textures_to_free[self.current_frame]);
+            if !to_free.is_empty() {
+                renderer.free_textures(&to_free).ok();
+            }
+            // Upload new egui textures before recording.
+            renderer
+                .set_textures(self.graphics_queue, self.command_pool, egui_textures_delta.set.as_slice())
+                .context("egui set_textures failed")?;
+        }
+        // Queue textures that need to be freed after this slot's GPU work completes.
+        self.egui_textures_to_free[self.current_frame] = egui_textures_delta.free;
 
         // Acquire next swapchain image.
         // Use a rotating index over swapchain_image_count semaphores (not frame-in-flight)
@@ -1051,16 +1556,35 @@ impl VulkanContext {
         }
 
         // Update lighting UBO for this frame (fence was waited on, so GPU is done with it).
-        let ubo = LightingUbo::from_state(lights, camera_pos);
-        self.resource_manager
-            .as_ref()
-            .expect("resource manager alive")
-            .write_buffer(self.ubo_buffers[self.current_frame], bytemuck::bytes_of(&ubo));
+        let rm_ref = self.resource_manager.as_ref().expect("resource manager alive");
+        rm_ref.write_buffer(self.ubo_buffers[self.current_frame], bytemuck::bytes_of(&lighting_ubo));
+
+        // Upload wireframe vertices for this frame (CpuToGpu, already waited on fence).
+        const WIREFRAME_BUF_BYTES: usize = 64 * 1024;
+        let wireframe_vertex_count = if show_wireframe && !wireframe_lines.is_empty() {
+            let bytes = bytemuck::cast_slice::<glam::Vec3, u8>(wireframe_lines);
+            let capped = &bytes[..bytes.len().min(WIREFRAME_BUF_BYTES)];
+            rm_ref.write_buffer(self.wireframe_vertex_buffers[self.current_frame], capped);
+            (capped.len() / std::mem::size_of::<glam::Vec3>()) as u32
+        } else {
+            0
+        };
+
+        // Upload gizmo vertices.
+        const GIZMO_BUF_BYTES: usize = 8 * 1024;
+        let has_gizmo = !gizmo_verts.is_empty();
+        if has_gizmo {
+            let bytes = bytemuck::cast_slice::<glam::Vec3, u8>(gizmo_verts);
+            let capped = &bytes[..bytes.len().min(GIZMO_BUF_BYTES)];
+            rm_ref.write_buffer(self.gizmo_vertex_buffers[self.current_frame], capped);
+        }
+
+        // Extract light_view_proj from the UBO (already computed by the caller).
+        let light_view_proj = glam::Mat4::from_cols_array(&lighting_ubo.light_mvp);
 
         // Record command buffer.
         let cmd = self.command_buffers[self.current_frame];
-        let light_view_proj = compute_light_mvp(&lights.directional);
-        self.record_command_buffer(cmd, image_index as usize, view_proj, light_view_proj)?;
+        self.record_command_buffer(cmd, image_index as usize, view_proj, light_view_proj, instances, wireframe_vertex_count, show_wireframe, has_gizmo, gizmo_groups, egui_primitives, egui_pixels_per_point, bloom_enabled, bloom_intensity, bloom_threshold, tone_aces)?;
 
         // Submit.
         let wait_semaphores = [acquire_sem];
@@ -1116,11 +1640,22 @@ impl VulkanContext {
     }
 
     fn record_command_buffer(
-        &self,
+        &mut self,
         cmd: vk::CommandBuffer,
         image_index: usize,
         view_proj: glam::Mat4,
         light_view_proj: glam::Mat4,
+        instances: &[(glam::Mat4, usize, usize)],
+        wireframe_vertex_count: u32,
+        show_wireframe: bool,
+        has_gizmo: bool,
+        gizmo_groups: &[(u32, u32, [f32; 4])],
+        egui_primitives: &[egui::ClippedPrimitive],
+        egui_pixels_per_point: f32,
+        bloom_enabled: bool,
+        bloom_intensity: f32,
+        bloom_threshold: f32,
+        tone_aces: bool,
     ) -> Result<()> {
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -1131,77 +1666,165 @@ impl VulkanContext {
             self.device.begin_command_buffer(cmd, &begin_info)?;
         }
 
-        let subresource_range = vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
-        };
-
-        // Transition: UNDEFINED → COLOR_ATTACHMENT_OPTIMAL
-        let barrier_to_color = vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::empty())
-            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(self.swapchain_images[image_index])
-            .subresource_range(subresource_range);
-
-        // SAFETY: cmd is recording, barrier data is valid.
-        unsafe {
-            self.device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier_to_color],
-            );
-        }
-
         // -----------------------------------------------------------------------
-        // Shadow pass: render scene depth from the directional light's perspective.
+        // Build the render graph for this frame.
         // -----------------------------------------------------------------------
-        let shadow_subresource = vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::DEPTH,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
-        };
         let rm = self.resource_manager.as_ref().expect("resource manager alive");
 
-        // Barrier: SHADER_READ_ONLY → DEPTH_STENCIL_ATTACHMENT_OPTIMAL
-        let shadow_to_write = vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_READ)
-            .dst_access_mask(
-                vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
-                    | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
-            )
-            .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .new_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(rm.get_image_raw(self.shadow_map))
-            .subresource_range(shadow_subresource);
+        let mut graph = RenderGraph::new();
 
-        // SAFETY: cmd is recording, barrier data is valid.
-        unsafe {
-            self.device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
-                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[shadow_to_write],
-            );
+        // Register image resources with their initial (per-frame) layouts.
+        let r_swapchain = graph.add_resource(
+            self.swapchain_images[image_index],
+            vk::ImageAspectFlags::COLOR,
+            vk::ImageLayout::UNDEFINED, // swapchain is UNDEFINED at frame start
+        );
+        let r_shadow = graph.add_resource(
+            rm.get_image_raw(self.shadow_map),
+            vk::ImageAspectFlags::DEPTH,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, // initialised at creation
+        );
+        // HDR color target — discard each frame (UNDEFINED).
+        let r_hdr = graph.add_resource(
+            rm.get_image_raw(self.hdr_color),
+            vk::ImageAspectFlags::COLOR,
+            vk::ImageLayout::UNDEFINED,
+        );
+        // Bloom chain — discard each frame (UNDEFINED).
+        let r_bloom: Vec<_> = self.bloom_images.iter().map(|&h| {
+            graph.add_resource(
+                rm.get_image_raw(h),
+                vk::ImageAspectFlags::COLOR,
+                vk::ImageLayout::UNDEFINED,
+            )
+        }).collect();
+        // Optional MSAA resources.
+        let r_msaa_color = self.msaa_color.map(|h| {
+            graph.add_resource(
+                rm.get_image_raw(h),
+                vk::ImageAspectFlags::COLOR,
+                vk::ImageLayout::UNDEFINED,
+            )
+        });
+        let r_msaa_depth = self.msaa_depth.map(|h| {
+            graph.add_resource(
+                rm.get_image_raw(h),
+                depth_aspect(self.depth_format),
+                vk::ImageLayout::UNDEFINED,
+            )
+        });
+
+        // --- Frame-init pseudo-pass: UNDEFINED → COLOR_ATTACHMENT / DEPTH_STENCIL ---
+        {
+            let mut init_accesses: Vec<(super::render_graph::ResourceId, ResourceAccess)> =
+                vec![
+                    (r_swapchain, ResourceAccess::color_init()),
+                    (r_hdr, ResourceAccess::color_init()),
+                ];
+            if let Some(rc) = r_msaa_color {
+                init_accesses.push((rc, ResourceAccess::color_init()));
+            }
+            if let Some(rd) = r_msaa_depth {
+                // MSAA depth: UNDEFINED → DEPTH_STENCIL. Use a plain depth subresource
+                // (the graph uses the aspect stored on the resource).
+                init_accesses.push((rd, ResourceAccess::depth_init()));
+            }
+            graph.add_pass("FrameInit", &init_accesses);
         }
+
+        // --- Shadow pass ---
+        graph.add_pass("Shadow", &[(r_shadow, ResourceAccess::shadow_write())]);
+
+        // --- Main + Skybox pass ---
+        // Renders to hdr_color (or msaa_color if MSAA, which resolves to hdr_color).
+        // After the pass, hdr_color transitions to SHADER_READ_ONLY for bloom/composite.
+        {
+            if let Some(rc) = r_msaa_color {
+                // MSAA: msaa_color is the render target, hdr_color is the resolve target.
+                // Both need COLOR_ATTACHMENT during the pass; hdr_color transitions to
+                // SHADER_READ_ONLY after (msaa_color stays COLOR_ATTACHMENT, not sampled).
+                graph.add_pass(
+                    "Main+Skybox",
+                    &[
+                        (rc,    ResourceAccess::color_attachment()),
+                        (r_hdr, ResourceAccess::color_attachment_to_read()),
+                        (r_shadow, ResourceAccess::shader_read()),
+                    ],
+                );
+            } else {
+                graph.add_pass(
+                    "Main+Skybox",
+                    &[
+                        (r_hdr, ResourceAccess::color_attachment_to_read()),
+                        (r_shadow, ResourceAccess::shader_read()),
+                    ],
+                );
+            }
+        }
+
+        // --- Bloom passes (conditional) ---
+        if bloom_enabled {
+            // Downsample: hdr_color → bloom[0] → bloom[1] → ... → bloom[BLOOM_LEVELS-1]
+            for i in 0..BLOOM_LEVELS {
+                // Each downsample writes to bloom[i] and transitions it to SHADER_READ_ONLY.
+                // The source (hdr_color or bloom[i-1]) is already SHADER_READ_ONLY from the
+                // previous pass's exit barrier, so no additional declaration needed here.
+                let pass_name: &'static str = match i {
+                    0 => "BloomDown0",
+                    1 => "BloomDown1",
+                    2 => "BloomDown2",
+                    3 => "BloomDown3",
+                    _ => "BloomDown4",
+                };
+                graph.add_pass(pass_name, &[(r_bloom[i], ResourceAccess::color_attachment_to_read())]);
+            }
+            // Upsample: bloom[BLOOM_LEVELS-2] ← bloom[BLOOM_LEVELS-1] (overwrite SHADER_READ_ONLY)
+            for i in (0..(BLOOM_LEVELS - 1)).rev() {
+                let pass_name: &'static str = match i {
+                    0 => "BloomUp0",
+                    1 => "BloomUp1",
+                    2 => "BloomUp2",
+                    _ => "BloomUp3",
+                };
+                graph.add_pass(pass_name, &[(r_bloom[i], ResourceAccess::bloom_overwrite())]);
+            }
+        }
+
+        // --- Composite pass: tone-map hdr_color + bloom → swapchain ---
+        // hdr_color and bloom[0] are already SHADER_READ_ONLY; swapchain is COLOR_ATTACHMENT.
+        graph.add_pass("Composite", &[(r_swapchain, ResourceAccess::color_attachment())]);
+
+        // --- Wireframe pass (conditional) ---
+        if show_wireframe && wireframe_vertex_count > 0 {
+            graph.add_pass("Wireframe", &[(r_swapchain, ResourceAccess::color_attachment())]);
+        }
+
+        // --- Gizmo pass (conditional) ---
+        if has_gizmo && !gizmo_groups.is_empty() {
+            graph.add_pass("Gizmo", &[(r_swapchain, ResourceAccess::color_attachment())]);
+        }
+
+        // --- Egui pass (conditional) ---
+        if !egui_primitives.is_empty() {
+            graph.add_pass("Egui", &[(r_swapchain, ResourceAccess::color_attachment())]);
+        }
+
+        // --- Present pseudo-pass: COLOR_ATTACHMENT → PRESENT_SRC ---
+        graph.add_pass("Present", &[(r_swapchain, ResourceAccess::present())]);
+
+        // Validate the graph (detect missing producers).
+        graph.compile()?;
+
+        // -----------------------------------------------------------------------
+        // FrameInit — no draw commands, just layout transitions via begin/end.
+        // -----------------------------------------------------------------------
+        graph.begin_pass(&self.device, cmd);
+        graph.end_pass(&self.device, cmd);
+
+        // -----------------------------------------------------------------------
+        // Shadow pass
+        // -----------------------------------------------------------------------
+        graph.begin_pass(&self.device, cmd);
 
         let shadow_depth_att = vk::RenderingAttachmentInfo::default()
             .image_view(rm.get_image_view(self.shadow_map))
@@ -1248,9 +1871,10 @@ impl VulkanContext {
                 self.shadow_pipeline,
             );
 
-            for instance in &self.instances {
+            for (model, mesh_idx, _mat_idx) in instances {
+                let mesh = &self.gpu_meshes[*mesh_idx];
                 // Push constant: full MVP from light's perspective = light_view_proj * model.
-                let light_mvp: glam::Mat4 = light_view_proj * instance.model;
+                let light_mvp: glam::Mat4 = light_view_proj * *model;
                 // SAFETY: Mat4 is Pod, 64 bytes; layout has this range.
                 self.device.cmd_push_constants(
                     cmd,
@@ -1263,68 +1887,74 @@ impl VulkanContext {
                 self.device.cmd_bind_vertex_buffers(
                     cmd,
                     0,
-                    &[rm.get_buffer(instance.mesh.vertex_buffer)],
+                    &[rm.get_buffer(mesh.vertex_buffer)],
                     &[0],
                 );
                 self.device.cmd_bind_index_buffer(
                     cmd,
-                    rm.get_buffer(instance.mesh.index_buffer),
+                    rm.get_buffer(mesh.index_buffer),
                     0,
                     vk::IndexType::UINT32,
                 );
-                self.device
-                    .cmd_draw_indexed(cmd, instance.mesh.index_count, 1, 0, 0, 0);
+                self.device.cmd_draw_indexed(cmd, mesh.index_count, 1, 0, 0, 0);
             }
 
             self.dynamic_rendering_loader.cmd_end_rendering(cmd);
         }
 
-        // Barrier: DEPTH_STENCIL_ATTACHMENT_OPTIMAL → SHADER_READ_ONLY_OPTIMAL
-        let shadow_to_read = vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            .old_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(rm.get_image_raw(self.shadow_map))
-            .subresource_range(shadow_subresource);
+        // end_pass emits the exit barrier: DEPTH_STENCIL → SHADER_READ_ONLY.
+        graph.end_pass(&self.device, cmd);
 
-        // SAFETY: cmd is recording, barrier data is valid.
-        unsafe {
-            self.device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
-                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[shadow_to_read],
-            );
-        }
+        // -----------------------------------------------------------------------
+        // Main pass (PBR meshes + skybox)
+        // -----------------------------------------------------------------------
+        graph.begin_pass(&self.device, cmd);
 
-        // Dynamic rendering with color + depth.
-        let color_attachment = vk::RenderingAttachmentInfo::default()
-            .image_view(self.swapchain_image_views[image_index])
-            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .clear_value(vk::ClearValue {
-                color: vk::ClearColorValue {
-                    float32: [0.01, 0.01, 0.05, 1.0],
-                },
-            });
+        let clear_color = vk::ClearValue {
+            color: vk::ClearColorValue { float32: [0.01, 0.01, 0.05, 1.0] },
+        };
+        let clear_depth = vk::ClearValue {
+            depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 },
+        };
 
-        let depth_view = rm.get_image_view(self.depth_image);
-        let depth_attachment = vk::RenderingAttachmentInfo::default()
-            .image_view(depth_view)
-            .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::DONT_CARE) // no need to read depth after render
-            .clear_value(vk::ClearValue {
-                depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 },
-            });
+        let color_attachment = if let Some(msaa_color) = self.msaa_color {
+            // MSAA: render to multisampled image, resolve to hdr_color.
+            vk::RenderingAttachmentInfo::default()
+                .image_view(rm.get_image_view(msaa_color))
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .resolve_mode(vk::ResolveModeFlags::AVERAGE)
+                .resolve_image_view(rm.get_image_view(self.hdr_color))
+                .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::DONT_CARE) // resolved copy is in hdr_color
+                .clear_value(clear_color)
+        } else {
+            // No MSAA: render directly to hdr_color.
+            vk::RenderingAttachmentInfo::default()
+                .image_view(rm.get_image_view(self.hdr_color))
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(clear_color)
+        };
+
+        let depth_attachment = if let Some(msaa_depth) = self.msaa_depth {
+            // MSAA depth: use the multisampled depth image (no resolve needed for depth).
+            vk::RenderingAttachmentInfo::default()
+                .image_view(rm.get_image_view(msaa_depth))
+                .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .clear_value(clear_depth)
+        } else {
+            // No MSAA: regular depth buffer.
+            vk::RenderingAttachmentInfo::default()
+                .image_view(rm.get_image_view(self.depth_image))
+                .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .clear_value(clear_depth)
+        };
 
         let color_attachments = [color_attachment];
         let rendering_info = vk::RenderingInfo::default()
@@ -1375,19 +2005,22 @@ impl VulkanContext {
                 &[],
             );
 
-            for instance in &self.instances {
+            for (model, mesh_idx, mat_set_idx) in instances {
+                let mesh = &self.gpu_meshes[*mesh_idx];
+                let material_set = self.material_sets[*mat_set_idx];
+
                 // Bind per-material textures (set 1).
                 self.device.cmd_bind_descriptor_sets(
                     cmd,
                     vk::PipelineBindPoint::GRAPHICS,
                     self.pipeline_layout,
                     1,
-                    &[instance.material_set],
+                    &[material_set],
                     &[],
                 );
 
-                let mvp = view_proj * instance.model;
-                let pc = MeshPushConstants { mvp, model: instance.model };
+                let mvp = view_proj * *model;
+                let pc = MeshPushConstants { mvp, model: *model };
                 // SAFETY: MeshPushConstants is Pod, 128 bytes; layout has this range.
                 self.device.cmd_push_constants(
                     cmd,
@@ -1400,52 +2033,694 @@ impl VulkanContext {
                 self.device.cmd_bind_vertex_buffers(
                     cmd,
                     0,
-                    &[rm.get_buffer(instance.mesh.vertex_buffer)],
+                    &[rm.get_buffer(mesh.vertex_buffer)],
                     &[0],
                 );
                 self.device.cmd_bind_index_buffer(
                     cmd,
-                    rm.get_buffer(instance.mesh.index_buffer),
+                    rm.get_buffer(mesh.index_buffer),
                     0,
                     vk::IndexType::UINT32,
                 );
                 // SAFETY: index_count matches what was uploaded; no index buffer overflow.
-                self.device
-                    .cmd_draw_indexed(cmd, instance.mesh.index_count, 1, 0, 0, 0);
+                self.device.cmd_draw_indexed(cmd, mesh.index_count, 1, 0, 0, 0);
             }
+
+            // Skybox: fullscreen triangle at depth=1.0.
+            // Passes LESS_OR_EQUAL test only where no geometry was drawn (depth buffer == 1.0).
+            self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.skybox_pipeline);
+            self.device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.skybox_pipeline_layout,
+                0,
+                &[self.skybox_descriptor_set],
+                &[],
+            );
+            let inv_view_proj = view_proj.inverse();
+            // SAFETY: Mat4 is Pod, 64 bytes; layout has a 64-byte VERTEX push constant.
+            self.device.cmd_push_constants(
+                cmd,
+                self.skybox_pipeline_layout,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                bytemuck::bytes_of(&inv_view_proj),
+            );
+            // 3 vertices, no vertex buffer — positions generated from gl_VertexIndex.
+            self.device.cmd_draw(cmd, 3, 1, 0, 0);
 
             self.dynamic_rendering_loader.cmd_end_rendering(cmd);
         }
 
-        // Transition: COLOR_ATTACHMENT_OPTIMAL → PRESENT_SRC_KHR
-        let barrier_to_present = vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-            .dst_access_mask(vk::AccessFlags::empty())
-            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(self.swapchain_images[image_index])
-            .subresource_range(subresource_range);
+        graph.end_pass(&self.device, cmd);
 
-        // SAFETY: cmd is recording, barrier data is valid.
-        unsafe {
-            self.device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier_to_present],
-            );
+        // -----------------------------------------------------------------------
+        // Bloom passes (conditional)
+        // -----------------------------------------------------------------------
+        if bloom_enabled {
+            // Push constant layout for bloom shaders: [texel_w, texel_h, param, _pad]
+            #[repr(C)]
+            #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+            struct BloomPc {
+                texel_w: f32,
+                texel_h: f32,
+                param: f32, // threshold (downsample) or blend (upsample)
+                _pad: f32,
+            }
+
+            // --- Downsample passes ---
+            for i in 0..BLOOM_LEVELS {
+                graph.begin_pass(&self.device, cmd);
+
+                let ext = self.bloom_extents[i];
+                let bloom_color_att = vk::RenderingAttachmentInfo::default()
+                    .image_view(rm.get_image_view(self.bloom_images[i]))
+                    .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .load_op(vk::AttachmentLoadOp::DONT_CARE)
+                    .store_op(vk::AttachmentStoreOp::STORE);
+                let bloom_rendering_info = vk::RenderingInfo::default()
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: ext,
+                    })
+                    .layer_count(1)
+                    .color_attachments(std::slice::from_ref(&bloom_color_att));
+
+                // Source texel size: if i==0, source is hdr_color; else bloom[i-1].
+                let (src_w, src_h) = if i == 0 {
+                    (self.swapchain_extent.width as f32, self.swapchain_extent.height as f32)
+                } else {
+                    (self.bloom_extents[i - 1].width as f32, self.bloom_extents[i - 1].height as f32)
+                };
+                let pc = BloomPc {
+                    texel_w: 1.0 / src_w,
+                    texel_h: 1.0 / src_h,
+                    param: bloom_threshold,
+                    _pad: 0.0,
+                };
+
+                // SAFETY: cmd is recording; all referenced handles are valid.
+                unsafe {
+                    self.dynamic_rendering_loader.cmd_begin_rendering(cmd, &bloom_rendering_info);
+
+                    let viewports = [vk::Viewport {
+                        x: 0.0, y: 0.0,
+                        width: ext.width as f32, height: ext.height as f32,
+                        min_depth: 0.0, max_depth: 1.0,
+                    }];
+                    self.device.cmd_set_viewport(cmd, 0, &viewports);
+                    let scissors = [vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: ext }];
+                    self.device.cmd_set_scissor(cmd, 0, &scissors);
+
+                    self.device.cmd_bind_pipeline(
+                        cmd, vk::PipelineBindPoint::GRAPHICS, self.bloom_downsample_pipeline,
+                    );
+                    self.device.cmd_bind_descriptor_sets(
+                        cmd, vk::PipelineBindPoint::GRAPHICS,
+                        self.bloom_downsample_pipeline_layout, 0,
+                        &[self.bloom_downsample_sets[i]], &[],
+                    );
+                    // SAFETY: BloomPc is Pod, 16 bytes; layout has a 16-byte FRAGMENT push constant.
+                    self.device.cmd_push_constants(
+                        cmd, self.bloom_downsample_pipeline_layout,
+                        vk::ShaderStageFlags::FRAGMENT, 0,
+                        bytemuck::bytes_of(&pc),
+                    );
+                    // Fullscreen triangle — no vertex buffer.
+                    self.device.cmd_draw(cmd, 3, 1, 0, 0);
+
+                    self.dynamic_rendering_loader.cmd_end_rendering(cmd);
+                }
+
+                graph.end_pass(&self.device, cmd);
+            }
+
+            // --- Upsample passes (BLOOM_LEVELS-2 down to 0) ---
+            for i in (0..(BLOOM_LEVELS - 1)).rev() {
+                graph.begin_pass(&self.device, cmd);
+
+                let ext = self.bloom_extents[i];
+                let bloom_color_att = vk::RenderingAttachmentInfo::default()
+                    .image_view(rm.get_image_view(self.bloom_images[i]))
+                    .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .load_op(vk::AttachmentLoadOp::DONT_CARE)
+                    .store_op(vk::AttachmentStoreOp::STORE);
+                let bloom_rendering_info = vk::RenderingInfo::default()
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: ext,
+                    })
+                    .layer_count(1)
+                    .color_attachments(std::slice::from_ref(&bloom_color_att));
+
+                // Source is bloom[i+1] (smaller level).
+                let src_ext = self.bloom_extents[i + 1];
+                let pc = BloomPc {
+                    texel_w: 1.0 / src_ext.width as f32,
+                    texel_h: 1.0 / src_ext.height as f32,
+                    param: bloom_intensity, // blend factor for upsample
+                    _pad: 0.0,
+                };
+
+                // SAFETY: cmd is recording; all referenced handles are valid.
+                unsafe {
+                    self.dynamic_rendering_loader.cmd_begin_rendering(cmd, &bloom_rendering_info);
+
+                    let viewports = [vk::Viewport {
+                        x: 0.0, y: 0.0,
+                        width: ext.width as f32, height: ext.height as f32,
+                        min_depth: 0.0, max_depth: 1.0,
+                    }];
+                    self.device.cmd_set_viewport(cmd, 0, &viewports);
+                    let scissors = [vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: ext }];
+                    self.device.cmd_set_scissor(cmd, 0, &scissors);
+
+                    self.device.cmd_bind_pipeline(
+                        cmd, vk::PipelineBindPoint::GRAPHICS, self.bloom_upsample_pipeline,
+                    );
+                    self.device.cmd_bind_descriptor_sets(
+                        cmd, vk::PipelineBindPoint::GRAPHICS,
+                        self.bloom_upsample_pipeline_layout, 0,
+                        &[self.bloom_upsample_sets[i]], &[],
+                    );
+                    // SAFETY: BloomPc is Pod, 16 bytes; layout has a 16-byte FRAGMENT push constant.
+                    self.device.cmd_push_constants(
+                        cmd, self.bloom_upsample_pipeline_layout,
+                        vk::ShaderStageFlags::FRAGMENT, 0,
+                        bytemuck::bytes_of(&pc),
+                    );
+                    self.device.cmd_draw(cmd, 3, 1, 0, 0);
+
+                    self.dynamic_rendering_loader.cmd_end_rendering(cmd);
+                }
+
+                graph.end_pass(&self.device, cmd);
+            }
         }
+
+        // -----------------------------------------------------------------------
+        // Composite pass: tone-map hdr_color + bloom → swapchain
+        // -----------------------------------------------------------------------
+        graph.begin_pass(&self.device, cmd);
+        {
+            let comp_color_att = vk::RenderingAttachmentInfo::default()
+                .image_view(self.swapchain_image_views[image_index])
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::DONT_CARE) // composite covers full screen
+                .store_op(vk::AttachmentStoreOp::STORE);
+            let comp_rendering_info = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: self.swapchain_extent,
+                })
+                .layer_count(1)
+                .color_attachments(std::slice::from_ref(&comp_color_att));
+
+            #[repr(C)]
+            #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+            struct CompositePc {
+                bloom_intensity: f32,
+                tone_mode: f32,      // 0 = Reinhard, 1 = ACES
+                bloom_enabled: f32,
+                _pad: f32,
+            }
+            let comp_pc = CompositePc {
+                bloom_intensity,
+                tone_mode: if tone_aces { 1.0 } else { 0.0 },
+                bloom_enabled: if bloom_enabled { 1.0 } else { 0.0 },
+                _pad: 0.0,
+            };
+
+            // SAFETY: cmd is recording; all referenced handles are valid.
+            unsafe {
+                self.dynamic_rendering_loader.cmd_begin_rendering(cmd, &comp_rendering_info);
+
+                // No Y-flip: hdr_color was rendered with Y-flip so it's already correctly oriented.
+                let viewports = [vk::Viewport {
+                    x: 0.0, y: 0.0,
+                    width: self.swapchain_extent.width as f32,
+                    height: self.swapchain_extent.height as f32,
+                    min_depth: 0.0, max_depth: 1.0,
+                }];
+                self.device.cmd_set_viewport(cmd, 0, &viewports);
+                let scissors = [vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: self.swapchain_extent,
+                }];
+                self.device.cmd_set_scissor(cmd, 0, &scissors);
+
+                self.device.cmd_bind_pipeline(
+                    cmd, vk::PipelineBindPoint::GRAPHICS, self.composite_pipeline,
+                );
+                self.device.cmd_bind_descriptor_sets(
+                    cmd, vk::PipelineBindPoint::GRAPHICS,
+                    self.composite_pipeline_layout, 0,
+                    &[self.composite_descriptor_set], &[],
+                );
+                // SAFETY: CompositePc is Pod, 16 bytes; layout has a 16-byte FRAGMENT push constant.
+                self.device.cmd_push_constants(
+                    cmd, self.composite_pipeline_layout,
+                    vk::ShaderStageFlags::FRAGMENT, 0,
+                    bytemuck::bytes_of(&comp_pc),
+                );
+                // Fullscreen triangle — no vertex buffer.
+                self.device.cmd_draw(cmd, 3, 1, 0, 0);
+
+                self.dynamic_rendering_loader.cmd_end_rendering(cmd);
+            }
+        }
+        graph.end_pass(&self.device, cmd);
+
+        // -----------------------------------------------------------------------
+        // Wireframe debug pass (conditional)
+        // -----------------------------------------------------------------------
+        if show_wireframe && wireframe_vertex_count > 0 {
+            graph.begin_pass(&self.device, cmd);
+
+            let wf_color_att = vk::RenderingAttachmentInfo::default()
+                .image_view(self.swapchain_image_views[image_index])
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::LOAD)
+                .store_op(vk::AttachmentStoreOp::STORE);
+
+            let wf_rendering_info = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: self.swapchain_extent,
+                })
+                .layer_count(1)
+                .color_attachments(std::slice::from_ref(&wf_color_att));
+
+            let wf_vbuf = rm.get_buffer(self.wireframe_vertex_buffers[self.current_frame]);
+
+            #[repr(C)]
+            #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+            struct WireframePc {
+                view_proj: glam::Mat4,
+                color: [f32; 4],
+            }
+            let pc = WireframePc {
+                view_proj,
+                color: [0.0, 1.0, 0.0, 1.0], // bright green
+            };
+
+            // SAFETY: cmd is recording; all referenced handles are valid.
+            unsafe {
+                self.dynamic_rendering_loader.cmd_begin_rendering(cmd, &wf_rendering_info);
+
+                let viewports = [vk::Viewport {
+                    x: 0.0,
+                    y: self.swapchain_extent.height as f32,
+                    width: self.swapchain_extent.width as f32,
+                    height: -(self.swapchain_extent.height as f32),
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }];
+                self.device.cmd_set_viewport(cmd, 0, &viewports);
+                let scissors = [vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: self.swapchain_extent,
+                }];
+                self.device.cmd_set_scissor(cmd, 0, &scissors);
+
+                self.device.cmd_bind_pipeline(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.wireframe_pipeline,
+                );
+                // SAFETY: WireframePc is Pod, 80 bytes; layout has an 80-byte VERTEX range.
+                self.device.cmd_push_constants(
+                    cmd,
+                    self.wireframe_pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    bytemuck::bytes_of(&pc),
+                );
+                self.device.cmd_bind_vertex_buffers(cmd, 0, &[wf_vbuf], &[0]);
+                self.device.cmd_draw(cmd, wireframe_vertex_count, 1, 0, 0);
+
+                self.dynamic_rendering_loader.cmd_end_rendering(cmd);
+            }
+
+            graph.end_pass(&self.device, cmd);
+        }
+
+        // -----------------------------------------------------------------------
+        // Gizmo pass (conditional — selected entity or active gizmo)
+        // -----------------------------------------------------------------------
+        if has_gizmo && !gizmo_groups.is_empty() {
+            graph.begin_pass(&self.device, cmd);
+
+            let gizmo_color_att = vk::RenderingAttachmentInfo::default()
+                .image_view(self.swapchain_image_views[image_index])
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::LOAD)
+                .store_op(vk::AttachmentStoreOp::STORE);
+
+            let gizmo_rendering_info = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D { offset: vk::Offset2D { x:0, y:0 }, extent: self.swapchain_extent })
+                .layer_count(1)
+                .color_attachments(std::slice::from_ref(&gizmo_color_att));
+
+            let gizmo_vbuf = rm.get_buffer(self.gizmo_vertex_buffers[self.current_frame]);
+
+            #[repr(C)]
+            #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+            struct GizmoPc { view_proj: glam::Mat4, color: [f32; 4] }
+
+            // SAFETY: cmd is recording; all handles valid.
+            unsafe {
+                self.dynamic_rendering_loader.cmd_begin_rendering(cmd, &gizmo_rendering_info);
+                let viewports = [vk::Viewport {
+                    x: 0.0, y: self.swapchain_extent.height as f32,
+                    width: self.swapchain_extent.width as f32,
+                    height: -(self.swapchain_extent.height as f32),
+                    min_depth: 0.0, max_depth: 1.0,
+                }];
+                self.device.cmd_set_viewport(cmd, 0, &viewports);
+                let scissors = [vk::Rect2D { offset: vk::Offset2D { x:0, y:0 }, extent: self.swapchain_extent }];
+                self.device.cmd_set_scissor(cmd, 0, &scissors);
+                self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.wireframe_pipeline);
+                self.device.cmd_bind_vertex_buffers(cmd, 0, &[gizmo_vbuf], &[0]);
+
+                for &(first_vertex, vertex_count, color) in gizmo_groups {
+                    if vertex_count == 0 { continue; }
+                    let pc = GizmoPc { view_proj, color };
+                    self.device.cmd_push_constants(
+                        cmd, self.wireframe_pipeline_layout,
+                        vk::ShaderStageFlags::VERTEX, 0, bytemuck::bytes_of(&pc),
+                    );
+                    self.device.cmd_draw(cmd, vertex_count, 1, first_vertex, 0);
+                }
+                self.dynamic_rendering_loader.cmd_end_rendering(cmd);
+            }
+            graph.end_pass(&self.device, cmd);
+        }
+
+        // -----------------------------------------------------------------------
+        // Egui pass (conditional)
+        // -----------------------------------------------------------------------
+        if !egui_primitives.is_empty() {
+            graph.begin_pass(&self.device, cmd);
+
+            let egui_color_att = vk::RenderingAttachmentInfo::default()
+                .image_view(self.swapchain_image_views[image_index])
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::LOAD)   // keep the rendered scene
+                .store_op(vk::AttachmentStoreOp::STORE);
+
+            let egui_rendering_info = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: self.swapchain_extent,
+                })
+                .layer_count(1)
+                .color_attachments(std::slice::from_ref(&egui_color_att));
+
+            // SAFETY: cmd is recording, all referenced objects are valid.
+            unsafe {
+                self.dynamic_rendering_loader.cmd_begin_rendering(cmd, &egui_rendering_info);
+            }
+
+            if let Some(ref mut renderer) = self.egui_renderer {
+                renderer
+                    .cmd_draw(cmd, self.swapchain_extent, egui_pixels_per_point, egui_primitives)
+                    .context("egui cmd_draw failed")?;
+            }
+
+            // SAFETY: matching cmd_begin_rendering above.
+            unsafe {
+                self.dynamic_rendering_loader.cmd_end_rendering(cmd);
+            }
+
+            graph.end_pass(&self.device, cmd);
+        }
+
+        // -----------------------------------------------------------------------
+        // Present pseudo-pass: COLOR_ATTACHMENT → PRESENT_SRC_KHR
+        // -----------------------------------------------------------------------
+        graph.begin_pass(&self.device, cmd);
+        graph.end_pass(&self.device, cmd);
 
         // SAFETY: cmd is recording with a matching begin.
         unsafe {
             self.device.end_command_buffer(cmd)?;
         }
 
+        Ok(())
+    }
+
+    /// Hot-reload: replace a pipeline without recreating its layout.
+    /// Calls `vkDeviceWaitIdle` which causes a brief stutter (see Phase 12 notes).
+    pub fn recreate_pipeline(
+        &mut self,
+        target: crate::asset::ShaderTarget,
+        vert_spv: &[u8],
+        frag_spv: &[u8],
+    ) -> Result<()> {
+        // SAFETY: wait for all in-flight GPU work so we can safely destroy the pipeline.
+        unsafe { self.device.device_wait_idle()? };
+
+        let binding_descriptions = [super::vertex::Vertex::binding_description()];
+        let attribute_descriptions = super::vertex::Vertex::attribute_descriptions();
+
+        match target {
+            crate::asset::ShaderTarget::Main => {
+                // SAFETY: device is idle, pipeline is not in use.
+                unsafe { self.device.destroy_pipeline(self.graphics_pipeline, None) };
+                self.graphics_pipeline = super::pipeline::build_graphics_pipeline(
+                    &self.device,
+                    vert_spv,
+                    frag_spv,
+                    self.pipeline_layout,
+                    HDR_FORMAT, // main pass renders to hdr_color
+                    self.depth_format,
+                    &binding_descriptions,
+                    &attribute_descriptions,
+                    self.msaa_samples,
+                )?;
+                log::info!("✓ Reloaded: main pipeline");
+            }
+            crate::asset::ShaderTarget::Shadow => {
+                // SAFETY: device is idle.
+                unsafe { self.device.destroy_pipeline(self.shadow_pipeline, None) };
+                self.shadow_pipeline = super::pipeline::build_shadow_pipeline(
+                    &self.device,
+                    vert_spv,
+                    frag_spv,
+                    self.shadow_pipeline_layout,
+                    self.depth_format,
+                    &binding_descriptions,
+                    &attribute_descriptions,
+                )?;
+                log::info!("✓ Reloaded: shadow pipeline");
+            }
+            crate::asset::ShaderTarget::Skybox => {
+                // SAFETY: device is idle.
+                unsafe { self.device.destroy_pipeline(self.skybox_pipeline, None) };
+                self.skybox_pipeline = super::pipeline::build_skybox_pipeline(
+                    &self.device,
+                    vert_spv,
+                    frag_spv,
+                    self.skybox_pipeline_layout,
+                    HDR_FORMAT, // skybox renders to hdr_color
+                    self.depth_format,
+                    self.msaa_samples,
+                )?;
+                log::info!("✓ Reloaded: skybox pipeline");
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn msaa_samples(&self) -> vk::SampleCountFlags { self.msaa_samples }
+    pub fn msaa_max(&self) -> vk::SampleCountFlags { self.msaa_max }
+
+    /// Replace all scene-specific GPU resources (meshes, textures, material descriptor sets)
+    /// with the contents of `scene_data`. The swap is atomic from the CPU perspective:
+    /// `vkDeviceWaitIdle` ensures no in-flight commands reference the old resources.
+    ///
+    /// After this call, `MeshRenderer.mesh_index` and `material_set_index` from the new
+    /// ECS world reference the updated global arrays.
+    pub fn reload_scene(&mut self, scene_data: &crate::asset::SceneData) -> Result<()> {
+        // SAFETY: wait for all in-flight GPU work before touching any resources.
+        unsafe { self.device.device_wait_idle().context("device_wait_idle failed")? };
+
+        // --- Free old scene meshes and textures ---
+        {
+            let rm = self.resource_manager.as_mut().context("resource manager unavailable")?;
+            for mesh in self.gpu_meshes.drain(..) {
+                rm.destroy_mesh(mesh);
+            }
+            for &tex in &self.scene_textures {
+                rm.destroy_image(tex);
+            }
+        }
+        self.scene_textures.clear();
+
+        // Destroy old material descriptor pool — implicitly frees all sets allocated from it.
+        // SAFETY: device is idle, pool is no longer referenced.
+        unsafe { self.device.destroy_descriptor_pool(self.material_descriptor_pool, None); }
+
+        // --- Upload new textures ---
+        {
+            let rm = self.resource_manager.as_mut().context("resource manager unavailable")?;
+            for tex in &scene_data.textures {
+                let format = if tex.is_srgb {
+                    vk::Format::R8G8B8A8_SRGB
+                } else {
+                    vk::Format::R8G8B8A8_UNORM
+                };
+                self.scene_textures.push(
+                    rm.upload_texture(&tex.pixels, tex.width, tex.height, format)?,
+                );
+            }
+        }
+
+        // --- Create new material descriptor pool ---
+        let num_material_sets = scene_data.materials.len() + 1; // +1 default
+        let pool_sizes = [vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            descriptor_count: (num_material_sets * 3) as u32,
+        }];
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .pool_sizes(&pool_sizes)
+            .max_sets(num_material_sets as u32);
+        // SAFETY: device is idle, pool_info is well-formed.
+        self.material_descriptor_pool =
+            unsafe { self.device.create_descriptor_pool(&pool_info, None) }
+                .context("Failed to create material descriptor pool")?;
+
+        // --- Allocate new material descriptor sets ---
+        let layouts = vec![self.material_set_layout; num_material_sets];
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.material_descriptor_pool)
+            .set_layouts(&layouts);
+        self.material_sets =
+            unsafe { self.device.allocate_descriptor_sets(&alloc_info) }
+                .context("Failed to allocate material descriptor sets")?;
+
+        // --- Write material descriptor sets ---
+        {
+            let rm = self.resource_manager.as_ref().context("resource manager unavailable")?;
+            let scene_textures = &self.scene_textures;
+            let (default_albedo, default_normal, default_mr) =
+                (self.default_albedo, self.default_normal, self.default_mr);
+
+            for (i, mat) in scene_data.materials.iter().enumerate() {
+                let albedo = mat.albedo_tex
+                    .and_then(|j| scene_textures.get(j).copied())
+                    .unwrap_or(default_albedo);
+                let normal = mat.normal_tex
+                    .and_then(|j| scene_textures.get(j).copied())
+                    .unwrap_or(default_normal);
+                let mr = mat.metallic_roughness_tex
+                    .and_then(|j| scene_textures.get(j).copied())
+                    .unwrap_or(default_mr);
+                write_material_set(
+                    &self.device, self.material_sets[i], self.sampler, rm,
+                    albedo, normal, mr,
+                );
+            }
+
+            // Default material set (last entry — all-default textures).
+            let def = num_material_sets - 1;
+            write_material_set(
+                &self.device, self.material_sets[def], self.sampler, rm,
+                default_albedo, default_normal, default_mr,
+            );
+        }
+
+        // --- Upload new meshes ---
+        {
+            let rm = self.resource_manager.as_mut().context("resource manager unavailable")?;
+            for data in &scene_data.meshes {
+                self.gpu_meshes.push(rm.upload_mesh(&data.vertices, &data.indices)?);
+            }
+        }
+
+        log::info!(
+            "Scene reloaded: {} meshes, {} materials, {} textures",
+            self.gpu_meshes.len(),
+            scene_data.materials.len(),
+            self.scene_textures.len(),
+        );
+        Ok(())
+    }
+
+    /// Change the MSAA sample count. Recreates MSAA images and rebuilds affected pipelines.
+    /// Calls `vkDeviceWaitIdle` — brief stutter, acceptable for a settings change.
+    pub fn set_msaa_samples(&mut self, new_samples: vk::SampleCountFlags) -> Result<()> {
+        if new_samples == self.msaa_samples {
+            return Ok(());
+        }
+
+        // SAFETY: wait for all in-flight GPU work.
+        unsafe { self.device.device_wait_idle()? };
+
+        // Destroy old MSAA images.
+        if let Some(ref mut rm) = self.resource_manager {
+            if let Some(h) = self.msaa_color.take() { rm.destroy_image(h); }
+            if let Some(h) = self.msaa_depth.take() { rm.destroy_image(h); }
+        }
+
+        self.msaa_samples = new_samples;
+
+        // Create new MSAA images (skip if TYPE_1 = no MSAA).
+        if new_samples != vk::SampleCountFlags::TYPE_1 {
+            if let Some(ref mut rm) = self.resource_manager {
+                let color = rm.create_msaa_image(
+                    self.swapchain_extent.width,
+                    self.swapchain_extent.height,
+                    HDR_FORMAT, // MSAA color resolves to hdr_color
+                    new_samples,
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                    vk::ImageAspectFlags::COLOR,
+                )?;
+                let depth = rm.create_msaa_image(
+                    self.swapchain_extent.width,
+                    self.swapchain_extent.height,
+                    self.depth_format,
+                    new_samples,
+                    vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+                    depth_aspect(self.depth_format),
+                )?;
+                self.msaa_color = Some(color);
+                self.msaa_depth = Some(depth);
+            }
+        }
+
+        // Rebuild graphics + skybox pipelines with the new sample count.
+        let binding_descriptions = [super::vertex::Vertex::binding_description()];
+        let attribute_descriptions = super::vertex::Vertex::attribute_descriptions();
+
+        // SAFETY: device is idle, pipelines are not in use.
+        unsafe { self.device.destroy_pipeline(self.graphics_pipeline, None) };
+        self.graphics_pipeline = super::pipeline::build_graphics_pipeline(
+            &self.device,
+            super::pipeline::VERT_SPV,
+            super::pipeline::FRAG_SPV,
+            self.pipeline_layout,
+            HDR_FORMAT, // main pass renders to hdr_color
+            self.depth_format,
+            &binding_descriptions,
+            &attribute_descriptions,
+            new_samples,
+        )?;
+
+        unsafe { self.device.destroy_pipeline(self.skybox_pipeline, None) };
+        self.skybox_pipeline = super::pipeline::build_skybox_pipeline(
+            &self.device,
+            super::pipeline::SKYBOX_VERT_SPV,
+            super::pipeline::SKYBOX_FRAG_SPV,
+            self.skybox_pipeline_layout,
+            HDR_FORMAT, // skybox renders to hdr_color
+            self.depth_format,
+            new_samples,
+        )?;
+
+        log::info!("MSAA changed to {:?}", new_samples);
         Ok(())
     }
 
@@ -1495,7 +2770,7 @@ impl VulkanContext {
         self.swapchain_image_views =
             create_image_views(&self.device, &self.swapchain_images, self.swapchain_format)?;
 
-        // Recreate depth buffer at the new size.
+        // Recreate depth buffer + MSAA images + HDR color + bloom at the new size.
         if let Some(ref mut rm) = self.resource_manager {
             rm.destroy_image(self.depth_image);
             self.depth_image = rm.create_attachment_image(
@@ -1510,6 +2785,121 @@ impl VulkanContext {
                 vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
                     | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
             )?;
+
+            // Recreate MSAA images if active.
+            if let Some(h) = self.msaa_color.take() { rm.destroy_image(h); }
+            if let Some(h) = self.msaa_depth.take() { rm.destroy_image(h); }
+            if self.msaa_samples != vk::SampleCountFlags::TYPE_1 {
+                let color = rm.create_msaa_image(
+                    extent.width, extent.height,
+                    HDR_FORMAT, self.msaa_samples, // MSAA color uses HDR_FORMAT
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                    vk::ImageAspectFlags::COLOR,
+                )?;
+                let depth = rm.create_msaa_image(
+                    extent.width, extent.height,
+                    self.depth_format, self.msaa_samples,
+                    vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+                    depth_aspect(self.depth_format),
+                )?;
+                self.msaa_color = Some(color);
+                self.msaa_depth = Some(depth);
+            }
+
+            // Recreate HDR color target.
+            rm.destroy_image(self.hdr_color);
+            self.hdr_color = rm.create_attachment_image(
+                extent.width, extent.height,
+                HDR_FORMAT,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                vk::ImageAspectFlags::COLOR,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::AccessFlags::SHADER_READ,
+            )?;
+
+            // Recreate bloom chain.
+            for h in self.bloom_images.drain(..) { rm.destroy_image(h); }
+            let mut new_bloom_extents = Vec::with_capacity(BLOOM_LEVELS);
+            let mut w = extent.width.max(2) / 2;
+            let mut h = extent.height.max(2) / 2;
+            for _ in 0..BLOOM_LEVELS {
+                let img = rm.create_attachment_image(
+                    w, h, HDR_FORMAT,
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                    vk::ImageAspectFlags::COLOR,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::AccessFlags::SHADER_READ,
+                )?;
+                self.bloom_images.push(img);
+                new_bloom_extents.push(vk::Extent2D { width: w, height: h });
+                w = (w / 2).max(1);
+                h = (h / 2).max(1);
+            }
+            self.bloom_extents = new_bloom_extents;
+
+            // Re-write all bloom descriptor sets to point at the new image views.
+            // ds[0] reads hdr_color, ds[i] reads bloom_images[i-1]
+            for i in 0..BLOOM_LEVELS {
+                let img_view = if i == 0 {
+                    rm.get_image_view(self.hdr_color)
+                } else {
+                    rm.get_image_view(self.bloom_images[i - 1])
+                };
+                let info = [vk::DescriptorImageInfo {
+                    sampler: self.bloom_sampler,
+                    image_view: img_view,
+                    image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                }];
+                let write = [vk::WriteDescriptorSet::default()
+                    .dst_set(self.bloom_downsample_sets[i])
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&info)];
+                // SAFETY: set, image view, and sampler are valid.
+                unsafe { self.device.update_descriptor_sets(&write, &[]) };
+            }
+            // us[i] reads bloom_images[i+1]
+            for i in 0..(BLOOM_LEVELS - 1) {
+                let info = [vk::DescriptorImageInfo {
+                    sampler: self.bloom_sampler,
+                    image_view: rm.get_image_view(self.bloom_images[i + 1]),
+                    image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                }];
+                let write = [vk::WriteDescriptorSet::default()
+                    .dst_set(self.bloom_upsample_sets[i])
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&info)];
+                // SAFETY: set, image view, and sampler are valid.
+                unsafe { self.device.update_descriptor_sets(&write, &[]) };
+            }
+            // Composite: binding 0 = hdr_color, binding 1 = bloom_images[0]
+            let hdr_img_info = [vk::DescriptorImageInfo {
+                sampler: self.bloom_sampler,
+                image_view: rm.get_image_view(self.hdr_color),
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            }];
+            let bloom_img_info = [vk::DescriptorImageInfo {
+                sampler: self.bloom_sampler,
+                image_view: rm.get_image_view(self.bloom_images[0]),
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            }];
+            let comp_writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(self.composite_descriptor_set)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&hdr_img_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(self.composite_descriptor_set)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&bloom_img_info),
+            ];
+            // SAFETY: set, image views, and sampler are valid.
+            unsafe { self.device.update_descriptor_sets(&comp_writes, &[]) };
         }
 
         // Recreate semaphores for new image count.
@@ -1569,11 +2959,17 @@ impl VulkanContext {
             // Order: UBO buffers → mesh buffers → textures → destroy_all (drops allocator).
             // gpu-allocator panics in debug if allocations survive the drop.
             if let Some(ref mut rm) = self.resource_manager {
+                for &buf in &self.wireframe_vertex_buffers {
+                    rm.destroy_buffer(buf);
+                }
+                for &buf in &self.gizmo_vertex_buffers {
+                    rm.destroy_buffer(buf);
+                }
                 for &buf in &self.ubo_buffers {
                     rm.destroy_buffer(buf);
                 }
-                for instance in self.instances.drain(..) {
-                    rm.destroy_mesh(instance.mesh);
+                for mesh in self.gpu_meshes.drain(..) {
+                    rm.destroy_mesh(mesh);
                 }
                 for &tex in &self.scene_textures {
                     rm.destroy_image(tex);
@@ -1582,7 +2978,15 @@ impl VulkanContext {
                 rm.destroy_image(self.default_normal);
                 rm.destroy_image(self.default_mr);
                 rm.destroy_image(self.depth_image);
+                if let Some(h) = self.msaa_color { rm.destroy_image(h); }
+                if let Some(h) = self.msaa_depth { rm.destroy_image(h); }
+                rm.destroy_image(self.hdr_color);
+                for h in self.bloom_images.drain(..) { rm.destroy_image(h); }
                 rm.destroy_image(self.shadow_map);
+                rm.destroy_image(self.skybox_image);
+                rm.destroy_image(self.irradiance_image);
+                rm.destroy_image(self.prefiltered_image);
+                rm.destroy_image(self.brdf_lut_image);
                 rm.destroy_all();
             }
             self.resource_manager = None;
@@ -1593,16 +2997,42 @@ impl VulkanContext {
             self.device
                 .destroy_descriptor_set_layout(self.material_set_layout, None);
 
+            // Bloom + composite descriptor pools + layouts + sampler.
+            // bloom_descriptor_pool and composite_descriptor_pool share the same handle.
+            self.device.destroy_descriptor_pool(self.bloom_descriptor_pool, None);
+            // composite_descriptor_pool == bloom_descriptor_pool; do not destroy twice.
+            self.device.destroy_descriptor_set_layout(self.composite_set_layout, None);
+            self.device.destroy_descriptor_set_layout(self.bloom_set_layout, None);
+            self.device.destroy_sampler(self.bloom_sampler, None);
+
             // Samplers
             self.device.destroy_sampler(self.shadow_sampler, None);
+            self.device.destroy_sampler(self.ibl_sampler, None);
             self.device.destroy_sampler(self.sampler, None);
+
+            // Skybox descriptor pool + layout (frees descriptor set when pool is destroyed).
+            self.device.destroy_descriptor_pool(self.skybox_descriptor_pool, None);
+            self.device.destroy_descriptor_set_layout(self.skybox_set_layout, None);
 
             // Lighting descriptor pool (frees its sets when destroyed).
             self.device.destroy_descriptor_pool(self.descriptor_pool, None);
             self.device
                 .destroy_descriptor_set_layout(self.lighting_set_layout, None);
 
+            // egui renderer (must be before device destruction)
+            drop(self.egui_renderer.take());
+
             // Pipelines + layouts (before swapchain, reverse creation order)
+            self.device.destroy_pipeline(self.composite_pipeline, None);
+            self.device.destroy_pipeline_layout(self.composite_pipeline_layout, None);
+            self.device.destroy_pipeline(self.bloom_upsample_pipeline, None);
+            self.device.destroy_pipeline_layout(self.bloom_upsample_pipeline_layout, None);
+            self.device.destroy_pipeline(self.bloom_downsample_pipeline, None);
+            self.device.destroy_pipeline_layout(self.bloom_downsample_pipeline_layout, None);
+            self.device.destroy_pipeline(self.wireframe_pipeline, None);
+            self.device.destroy_pipeline_layout(self.wireframe_pipeline_layout, None);
+            self.device.destroy_pipeline(self.skybox_pipeline, None);
+            self.device.destroy_pipeline_layout(self.skybox_pipeline_layout, None);
             self.device
                 .destroy_pipeline(self.graphics_pipeline, None);
             self.device

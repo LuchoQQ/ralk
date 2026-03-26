@@ -1,5 +1,5 @@
 use crate::scene::{DirectionalLight, PointLight, Transform};
-use super::{AudioUiState, DebugSettings, FrameStats, PhysicsUiState, SceneUiState};
+use super::{AudioUiState, DebugSettings, EditorUiState, FrameStats, PhysicsUiState, SceneUiState};
 
 /// Stats panel: FPS, frame time, culling stats, shader reload log.
 pub fn stats_panel(ctx: &egui::Context, stats: &FrameStats) {
@@ -106,6 +106,48 @@ pub fn audio_panel(ctx: &egui::Context, state: &mut AudioUiState) {
                 ui.label(format!("{:.0}%", state.master_volume * 100.0));
             });
             ui.checkbox(&mut state.muted, "Mute");
+        });
+}
+
+/// Editor panel: selected entity transform + gizmo mode.
+pub fn editor_panel(ctx: &egui::Context, state: &mut EditorUiState) {
+    egui::Window::new("Editor")
+        .default_pos([10.0, 880.0])
+        .resizable(false)
+        .show(ctx, |ui| {
+            if state.selected_entity.is_none() {
+                ui.label("No entity selected");
+                ui.label("Press Esc to release mouse, then click to select");
+                return;
+            }
+            ui.label("Transform");
+            let mut changed = false;
+            ui.horizontal(|ui| {
+                ui.label("Pos");
+                changed |= ui.add(egui::DragValue::new(&mut state.position[0]).speed(0.01).prefix("X:")).changed();
+                changed |= ui.add(egui::DragValue::new(&mut state.position[1]).speed(0.01).prefix("Y:")).changed();
+                changed |= ui.add(egui::DragValue::new(&mut state.position[2]).speed(0.01).prefix("Z:")).changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label("Rot");
+                changed |= ui.add(egui::DragValue::new(&mut state.rotation_euler_deg[0]).speed(0.5).suffix("°").prefix("X:")).changed();
+                changed |= ui.add(egui::DragValue::new(&mut state.rotation_euler_deg[1]).speed(0.5).suffix("°").prefix("Y:")).changed();
+                changed |= ui.add(egui::DragValue::new(&mut state.rotation_euler_deg[2]).speed(0.5).suffix("°").prefix("Z:")).changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label("Scl");
+                changed |= ui.add(egui::DragValue::new(&mut state.scale[0]).speed(0.01).prefix("X:")).changed();
+                changed |= ui.add(egui::DragValue::new(&mut state.scale[1]).speed(0.01).prefix("Y:")).changed();
+                changed |= ui.add(egui::DragValue::new(&mut state.scale[2]).speed(0.01).prefix("Z:")).changed();
+            });
+            if changed { state.transform_changed = true; }
+            ui.separator();
+            ui.label("Gizmo mode (W/E/R)");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut state.gizmo_mode, 0, "Translate [W]");
+                ui.selectable_value(&mut state.gizmo_mode, 1, "Rotate [E]");
+                ui.selectable_value(&mut state.gizmo_mode, 2, "Scale [R]");
+            });
         });
 }
 

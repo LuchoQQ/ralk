@@ -380,16 +380,20 @@ impl GpuResourceManager {
             unsafe { std::ptr::copy_nonoverlapping(pixels.as_ptr(), mapped, pixels.len()) };
         }
 
+        // Compute mip levels: floor(log2(max(w,h))) + 1.
+        let mip_levels = (width.max(height) as f32).log2().floor() as u32 + 1;
+
         // --- VkImage (device-local, optimal tiling) ---
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
             .extent(vk::Extent3D { width, height, depth: 1 })
-            .mip_levels(1)
+            .mip_levels(mip_levels)
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+            // TRANSFER_SRC needed to blit mip N-1 → N during mip generation.
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::SAMPLED)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
@@ -420,7 +424,7 @@ impl GpuResourceManager {
         }
         .context("Failed to bind image memory")?;
 
-        // --- VkImageView ---
+        // --- VkImageView (covers all mip levels) ---
         let view_info = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
@@ -428,7 +432,7 @@ impl GpuResourceManager {
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 base_mip_level: 0,
-                level_count: 1,
+                level_count: mip_levels,
                 base_array_layer: 0,
                 layer_count: 1,
             });
@@ -437,18 +441,18 @@ impl GpuResourceManager {
         let image_view = unsafe { self.device.create_image_view(&view_info, None) }
             .context("Failed to create image view")?;
 
-        // --- Upload: layout transition → copy → layout transition ---
+        // --- Upload: layout transition → copy mip 0 → blit chain → transition to shader-read ---
         let staging_vk = self.buffers[&staging.0].buffer;
-        let subresource_range = vk::ImageSubresourceRange {
+        let full_range = vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
             base_mip_level: 0,
-            level_count: 1,
+            level_count: mip_levels,
             base_array_layer: 0,
             layer_count: 1,
         };
 
         self.execute_one_shot(|device, cmd| {
-            // UNDEFINED → TRANSFER_DST_OPTIMAL
+            // Transition ALL mip levels: UNDEFINED → TRANSFER_DST_OPTIMAL
             let to_transfer = vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::empty())
                 .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -457,7 +461,7 @@ impl GpuResourceManager {
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(image)
-                .subresource_range(subresource_range);
+                .subresource_range(full_range);
             // SAFETY: cmd is recording.
             unsafe {
                 device.cmd_pipeline_barrier(
@@ -469,7 +473,7 @@ impl GpuResourceManager {
                 );
             }
 
-            // Copy buffer → image
+            // Copy staging buffer → mip 0
             let region = vk::BufferImageCopy {
                 buffer_offset: 0,
                 buffer_row_length: 0,
@@ -486,16 +490,115 @@ impl GpuResourceManager {
             // SAFETY: cmd is recording, staging buffer and image are valid.
             unsafe {
                 device.cmd_copy_buffer_to_image(
-                    cmd,
-                    staging_vk,
-                    image,
+                    cmd, staging_vk, image,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     &[region],
                 );
             }
 
-            // TRANSFER_DST_OPTIMAL → SHADER_READ_ONLY_OPTIMAL
-            let to_shader = vk::ImageMemoryBarrier::default()
+            // Blit chain: generate mip levels 1..N from the previous level.
+            let mut mip_w = width;
+            let mut mip_h = height;
+            for i in 1..mip_levels {
+                let src_range = vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: i - 1,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+
+                // Transition mip i-1: TRANSFER_DST → TRANSFER_SRC (blit source)
+                let to_src = vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(src_range);
+                // SAFETY: cmd is recording.
+                unsafe {
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[], &[], &[to_src],
+                    );
+                }
+
+                let next_w = (mip_w / 2).max(1);
+                let next_h = (mip_h / 2).max(1);
+
+                let blit = vk::ImageBlit {
+                    src_subresource: vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: i - 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    src_offsets: [
+                        vk::Offset3D { x: 0, y: 0, z: 0 },
+                        vk::Offset3D { x: mip_w as i32, y: mip_h as i32, z: 1 },
+                    ],
+                    dst_subresource: vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: i,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    dst_offsets: [
+                        vk::Offset3D { x: 0, y: 0, z: 0 },
+                        vk::Offset3D { x: next_w as i32, y: next_h as i32, z: 1 },
+                    ],
+                };
+                // SAFETY: cmd is recording, both mip levels are in valid layouts.
+                unsafe {
+                    device.cmd_blit_image(
+                        cmd,
+                        image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        image, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[blit],
+                        vk::Filter::LINEAR,
+                    );
+                }
+
+                // Transition mip i-1: TRANSFER_SRC → SHADER_READ_ONLY (done with it)
+                let to_shader = vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(src_range);
+                // SAFETY: cmd is recording.
+                unsafe {
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::FRAGMENT_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[], &[], &[to_shader],
+                    );
+                }
+
+                mip_w = next_w;
+                mip_h = next_h;
+            }
+
+            // Transition the last mip level: TRANSFER_DST → SHADER_READ_ONLY
+            let last_range = vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: mip_levels - 1,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            };
+            let last_to_shader = vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ)
                 .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
@@ -503,7 +606,7 @@ impl GpuResourceManager {
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(image)
-                .subresource_range(subresource_range);
+                .subresource_range(last_range);
             // SAFETY: cmd is recording.
             unsafe {
                 device.cmd_pipeline_barrier(
@@ -511,7 +614,7 @@ impl GpuResourceManager {
                     vk::PipelineStageFlags::TRANSFER,
                     vk::PipelineStageFlags::FRAGMENT_SHADER,
                     vk::DependencyFlags::empty(),
-                    &[], &[], &[to_shader],
+                    &[], &[], &[last_to_shader],
                 );
             }
         })?;
@@ -523,6 +626,281 @@ impl GpuResourceManager {
         self.images.insert(id, ImageEntry { image, image_view, allocation: Some(allocation) });
 
         log::debug!("Texture uploaded ({width}×{height}, {size} bytes)");
+        Ok(ImageHandle(id))
+    }
+
+    /// Upload raw bytes to a device-local 2D image (any format, any bytes-per-pixel).
+    ///
+    /// Unlike `upload_texture`, this function imposes no constraint on format or
+    /// bytes-per-pixel — `data.len()` is used as the staging size directly.
+    pub fn upload_image_raw(
+        &mut self,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        format: vk::Format,
+    ) -> Result<ImageHandle> {
+        let size = data.len() as u64;
+
+        let staging = self.create_buffer(size, vk::BufferUsageFlags::TRANSFER_SRC, MemoryLocation::CpuToGpu)?;
+        {
+            let entry = self.buffers.get(&staging.0).expect("staging exists");
+            let mapped = entry.allocation.as_ref().unwrap().mapped_ptr()
+                .expect("staging is host-visible").as_ptr() as *mut u8;
+            // SAFETY: mapped ptr valid for `size` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), mapped, data.len()) };
+        }
+
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D { width, height, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+        // SAFETY: device is valid.
+        let image = unsafe { self.device.create_image(&image_info, None) }
+            .context("Failed to create raw image")?;
+
+        let requirements = unsafe { self.device.get_image_memory_requirements(image) };
+        let allocation = self.allocator.as_mut().expect("allocator alive")
+            .allocate(&AllocationCreateDesc {
+                name: "raw_image",
+                requirements,
+                location: MemoryLocation::GpuOnly,
+                linear: false,
+                allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+            })
+            .context("Failed to allocate raw image memory")?;
+
+        // SAFETY: image and allocation are valid.
+        unsafe { self.device.bind_image_memory(image, allocation.memory(), allocation.offset()) }
+            .context("Failed to bind raw image memory")?;
+
+        let subresource_range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image).view_type(vk::ImageViewType::TYPE_2D).format(format)
+            .subresource_range(subresource_range);
+
+        // SAFETY: device, image, and format are valid.
+        let image_view = unsafe { self.device.create_image_view(&view_info, None) }
+            .context("Failed to create raw image view")?;
+
+        let staging_vk = self.buffers[&staging.0].buffer;
+        self.execute_one_shot(|device, cmd| {
+            let to_transfer = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image).subresource_range(subresource_range);
+            // SAFETY: cmd is recording.
+            unsafe {
+                device.cmd_pipeline_barrier(cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(), &[], &[], &[to_transfer]);
+                device.cmd_copy_buffer_to_image(cmd, staging_vk, image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[vk::BufferImageCopy {
+                        buffer_offset: 0, buffer_row_length: 0, buffer_image_height: 0,
+                        image_subresource: vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            mip_level: 0, base_array_layer: 0, layer_count: 1,
+                        },
+                        image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                        image_extent: vk::Extent3D { width, height, depth: 1 },
+                    }]);
+            }
+            let to_shader = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image).subresource_range(subresource_range);
+            // SAFETY: cmd is recording.
+            unsafe {
+                device.cmd_pipeline_barrier(cmd,
+                    vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(), &[], &[], &[to_shader]);
+            }
+        })?;
+
+        self.destroy_buffer(staging);
+
+        let id = self.next_image_id;
+        self.next_image_id += 1;
+        self.images.insert(id, ImageEntry { image, image_view, allocation: Some(allocation) });
+
+        log::debug!("Raw image uploaded ({width}×{height}, {size} bytes, {format:?})");
+        Ok(ImageHandle(id))
+    }
+
+    /// Upload a cubemap with one or more mip levels.
+    ///
+    /// `mip_faces[mip][face]` holds the pre-encoded bytes for that mip/face.
+    /// `base_face_size` is the width/height of mip 0; each successive mip is half that.
+    /// `format` must be consistent with the byte layout (e.g. R16G16B16A16_SFLOAT = 8 bytes/px).
+    pub fn upload_cubemap_mips(
+        &mut self,
+        mip_faces: &[Vec<Vec<u8>>],
+        base_face_size: u32,
+        format: vk::Format,
+    ) -> Result<ImageHandle> {
+        let mip_levels = mip_faces.len() as u32;
+
+        // Concatenate all mip/face data into one staging buffer.
+        let total_size: u64 = mip_faces.iter()
+            .flat_map(|faces| faces.iter())
+            .map(|f| f.len() as u64)
+            .sum();
+
+        let staging = self.create_buffer(total_size, vk::BufferUsageFlags::TRANSFER_SRC, MemoryLocation::CpuToGpu)?;
+        {
+            let entry = self.buffers.get(&staging.0).expect("staging exists");
+            let mapped = entry.allocation.as_ref().unwrap().mapped_ptr()
+                .expect("host-visible").as_ptr() as *mut u8;
+            let mut offset = 0usize;
+            for faces in mip_faces {
+                for face_data in faces {
+                    // SAFETY: mapped pointer covers total_size bytes, offset stays in bounds.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(face_data.as_ptr(), mapped.add(offset), face_data.len());
+                    }
+                    offset += face_data.len();
+                }
+            }
+        }
+
+        // Create VkImage with CUBE_COMPATIBLE flag.
+        let image_info = vk::ImageCreateInfo::default()
+            .flags(vk::ImageCreateFlags::CUBE_COMPATIBLE)
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D { width: base_face_size, height: base_face_size, depth: 1 })
+            .mip_levels(mip_levels)
+            .array_layers(6)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+        // SAFETY: device is valid.
+        let image = unsafe { self.device.create_image(&image_info, None) }
+            .context("Failed to create cubemap image")?;
+
+        let requirements = unsafe { self.device.get_image_memory_requirements(image) };
+        let allocation = self.allocator.as_mut().expect("allocator alive")
+            .allocate(&AllocationCreateDesc {
+                name: "cubemap",
+                requirements,
+                location: MemoryLocation::GpuOnly,
+                linear: false,
+                allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+            })
+            .context("Failed to allocate cubemap memory")?;
+
+        // SAFETY: image and allocation are valid.
+        unsafe { self.device.bind_image_memory(image, allocation.memory(), allocation.offset()) }
+            .context("Failed to bind cubemap memory")?;
+
+        // Build one BufferImageCopy per mip × face.
+        let mut copies: Vec<vk::BufferImageCopy> = Vec::new();
+        let mut buf_offset = 0u64;
+        for (mip, faces) in mip_faces.iter().enumerate() {
+            let face_size = (base_face_size >> mip).max(1);
+            for (face, face_data) in faces.iter().enumerate() {
+                copies.push(vk::BufferImageCopy {
+                    buffer_offset: buf_offset,
+                    buffer_row_length: 0,
+                    buffer_image_height: 0,
+                    image_subresource: vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: mip as u32,
+                        base_array_layer: face as u32,
+                        layer_count: 1,
+                    },
+                    image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                    image_extent: vk::Extent3D { width: face_size, height: face_size, depth: 1 },
+                });
+                buf_offset += face_data.len() as u64;
+            }
+        }
+
+        let full_range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: mip_levels,
+            base_array_layer: 0,
+            layer_count: 6,
+        };
+        let staging_vk = self.buffers[&staging.0].buffer;
+
+        self.execute_one_shot(|device, cmd| {
+            let to_transfer = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image).subresource_range(full_range);
+            // SAFETY: cmd is recording.
+            unsafe {
+                device.cmd_pipeline_barrier(cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(), &[], &[], &[to_transfer]);
+                device.cmd_copy_buffer_to_image(cmd, staging_vk, image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL, &copies);
+            }
+            let to_shader = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image).subresource_range(full_range);
+            // SAFETY: cmd is recording.
+            unsafe {
+                device.cmd_pipeline_barrier(cmd,
+                    vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(), &[], &[], &[to_shader]);
+            }
+        })?;
+
+        self.destroy_buffer(staging);
+
+        // CUBE image view spanning all layers and mip levels.
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::CUBE)
+            .format(format)
+            .subresource_range(full_range);
+
+        // SAFETY: device, image, and format are valid.
+        let image_view = unsafe { self.device.create_image_view(&view_info, None) }
+            .context("Failed to create cubemap image view")?;
+
+        let id = self.next_image_id;
+        self.next_image_id += 1;
+        self.images.insert(id, ImageEntry { image, image_view, allocation: Some(allocation) });
+
+        log::info!("Cubemap uploaded ({base_face_size}×{base_face_size}, {mip_levels} mips, {format:?})");
         Ok(ImageHandle(id))
     }
 
@@ -662,6 +1040,79 @@ impl GpuResourceManager {
         self.images.insert(id, ImageEntry { image, image_view, allocation: Some(allocation) });
 
         log::debug!("Attachment image created ({width}×{height}, {format:?})");
+        Ok(ImageHandle(id))
+    }
+
+    /// Create a MSAA image (multisampled, no initial layout transition).
+    /// The caller is responsible for transitioning via barriers before use.
+    pub fn create_msaa_image(
+        &mut self,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        samples: vk::SampleCountFlags,
+        usage: vk::ImageUsageFlags,
+        aspect: vk::ImageAspectFlags,
+    ) -> Result<ImageHandle> {
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D { width, height, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(samples)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(usage)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+        // SAFETY: device is valid.
+        let image = unsafe { self.device.create_image(&image_info, None) }
+            .context("Failed to create MSAA image")?;
+
+        // SAFETY: device and image are valid.
+        let requirements = unsafe { self.device.get_image_memory_requirements(image) };
+
+        let allocation = self
+            .allocator
+            .as_mut()
+            .expect("allocator alive")
+            .allocate(&AllocationCreateDesc {
+                name: "msaa",
+                requirements,
+                location: MemoryLocation::GpuOnly,
+                linear: false,
+                allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+            })
+            .context("Failed to allocate MSAA image memory")?;
+
+        // SAFETY: image and allocation are valid.
+        unsafe {
+            self.device.bind_image_memory(image, allocation.memory(), allocation.offset())
+        }
+        .context("Failed to bind MSAA image memory")?;
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(format)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: aspect,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+
+        // SAFETY: device, image, and format are valid.
+        let image_view = unsafe { self.device.create_image_view(&view_info, None) }
+            .context("Failed to create MSAA image view")?;
+
+        let id = self.next_image_id;
+        self.next_image_id += 1;
+        self.images.insert(id, ImageEntry { image, image_view, allocation: Some(allocation) });
+
+        log::debug!("MSAA image created ({width}×{height}, {format:?}, {samples:?})");
         Ok(ImageHandle(id))
     }
 
