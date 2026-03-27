@@ -40,16 +40,22 @@ pub struct GpuMesh {
 }
 
 /// Per-instance GPU data written to the instance SSBO every frame.
-/// Matches the GLSL `InstanceData` struct in cull.comp / triangle.vert (std430, 112 bytes).
+/// Matches the GLSL `InstanceData` struct in cull.comp / triangle.vert (std430, 160 bytes).
+/// Fase 44: extended from 112 to 160 bytes to include material override data.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct InstanceData {
-    pub model:      [[f32; 4]; 4],  // 64 bytes
-    pub world_min:  [f32; 4],       // 16 bytes — world-space AABB min (xyz, w unused)
-    pub world_max:  [f32; 4],       // 16 bytes — world-space AABB max (xyz, w unused)
-    pub mesh_index: u32,            //  4 bytes
-    pub _pad:       [u32; 3],       // 12 bytes
-}
+    pub model:            [[f32; 4]; 4],  // offset   0 — 64 bytes
+    pub world_min:        [f32; 4],       // offset  64 — 16 bytes (xyz world AABB min)
+    pub world_max:        [f32; 4],       // offset  80 — 16 bytes (xyz world AABB max)
+    pub mesh_index:       u32,            // offset  96 —  4 bytes
+    pub override_flags:   u32,            // offset 100 —  4 bytes (Fase 44: bitmask)
+    pub _pad1:            u32,            // offset 104
+    pub _pad2:            u32,            // offset 108
+    pub override_color:   [f32; 4],       // offset 112 — 16 bytes (rgb=albedo, a unused)
+    pub override_mr:      [f32; 4],       // offset 128 — 16 bytes (x=metallic, y=roughness)
+    pub override_emissive:[f32; 4],       // offset 144 — 16 bytes (xyz=color, w=intensity)
+}                                         // total 160 bytes
 
 /// One LOD level in the GPU mesh-info SSBO. 8 bytes.
 #[repr(C)]

@@ -182,6 +182,20 @@ impl PhysicsWorld {
         (body_handle, collider_handle)
     }
 
+    /// Teleport any body (static, dynamic, kinematic) to a new pose.
+    /// Use for animated objects (PropertyAnimator) that need their collider to follow.
+    pub fn set_body_pose(&mut self, handle: RigidBodyHandle, position: Vec3, rotation: Quat) {
+        if let Some(rb) = self.rigid_bodies.get_mut(handle) {
+            let iso = rapier3d::math::Isometry::from_parts(
+                vector![position.x, position.y, position.z].into(),
+                UnitQuaternion::from_quaternion(
+                    rapier3d::na::Quaternion::new(rotation.w, rotation.x, rotation.y, rotation.z),
+                ),
+            );
+            rb.set_position(iso, true);
+        }
+    }
+
     /// Sync a kinematic body's pose from a glam transform (call before step).
     pub fn set_kinematic_pose(&mut self, handle: RigidBodyHandle, position: Vec3, rotation: Quat) {
         if let Some(rb) = self.rigid_bodies.get_mut(handle) {

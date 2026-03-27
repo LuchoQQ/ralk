@@ -28,6 +28,7 @@ rapier3d = { version = "0.22", features = ["simd-stable"] }
 rodio = "0.19"
 meshopt = "0.3"
 mlua = { version = "0.10", features = ["lua54", "vendored"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [build-dependencies]
 shaderc = "0.8"

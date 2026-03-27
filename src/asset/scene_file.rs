@@ -42,6 +42,9 @@ pub struct PlacedProp {
     pub position: [f32; 3],
     pub rotation: [f32; 4],
     pub scale: [f32; 3],
+    /// Fase 38: index of parent entity in the entities array (null = root).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_index: Option<usize>,
 }
 
 /// Top-level scene file. Saved/loaded from `scenes/{name}.json`.
@@ -102,6 +105,50 @@ pub struct ColliderDef {
     pub friction: f32,
 }
 
+/// Property animation parameters stored in scene.json (Fase 41).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PropertyAnimatorDef {
+    pub from_rot_y: f32,
+    pub to_rot_y: f32,
+    pub duration: f32,
+    #[serde(default)]
+    pub looping: bool,
+}
+
+/// Trigger zone parameters stored in scene.json (Fase 42).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriggerZoneDef {
+    /// "box" or "sphere"
+    pub shape: String,
+    pub size: [f32; 3],
+    /// "play_animation", "play_sound", "toggle_entity"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_enter_action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_enter_target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_enter_sound_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_enter_sound_volume: Option<f32>,
+    #[serde(default)]
+    pub once: bool,
+}
+
+/// Material override parameters stored in scene.json (Fase 44).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaterialOverrideDef {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_color: Option<[f32; 4]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metallic: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub roughness: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emissive: Option<[f32; 3]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emissive_intensity: Option<f32>,
+}
+
 /// One renderable entity in the scene.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntityDef {
@@ -113,12 +160,30 @@ pub struct EntityDef {
     /// Quaternion stored as [x, y, z, w].
     pub rotation: [f32; 4],
     pub scale: [f32; 3],
+    /// Optional display name for the scene tree (Fase 38).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Fase 38: index of parent entity in the entities array (null = root).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_index: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rigid_body: Option<RigidBodyDef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collider: Option<ColliderDef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_source: Option<AudioSourceDef>,
+    /// Fase 41: property animation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub property_animator: Option<PropertyAnimatorDef>,
+    /// Fase 42: trigger zone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger_zone: Option<TriggerZoneDef>,
+    /// Fase 44: material override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub material_override: Option<MaterialOverrideDef>,
+    /// Fase 39: prefab this entity came from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefab_path: Option<String>,
 }
 
 /// Directional (sun) light parameters.

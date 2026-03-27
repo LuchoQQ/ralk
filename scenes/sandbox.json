@@ -3,141 +3,693 @@
     "skybox": "",
     "terrain": "",
     "character": "",
-    "props_catalog": "assets/props/default_props.json"
+    "props_catalog": ""
   },
   "player": {
-    "position": [0.0, 2.0, 5.0],
-    "camera_yaw": 0.0,
-    "camera_pitch": -0.2
+    "position": [
+      -5.3335123,
+      3.8921833,
+      -2.9614234
+    ],
+    "camera_yaw": 8.036003,
+    "camera_pitch": 0.4660002
   },
-  "time_of_day": 0.0,
+  "time_of_day": 0.26796174,
   "day_night_speed": 1.0,
   "models": [],
   "entities": [
     {
       "mesh_index": 0,
       "material_set_index": 0,
-      "position": [0.0, -0.25, 0.0],
-      "rotation": [0.0, 0.0, 0.0, 1.0],
-      "scale": [40.0, 0.5, 40.0],
-      "rigid_body": { "body_type": "static" },
-      "collider": { "half_extents": [20.0, 0.25, 20.0], "restitution": 0.4, "friction": 0.7 }
+      "position": [
+        0.0,
+        -0.25,
+        0.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        40.0,
+        0.5,
+        40.0
+      ],
+      "rigid_body": {
+        "body_type": "static"
+      },
+      "collider": {
+        "half_extents": [
+          20.0,
+          0.25,
+          20.0
+        ],
+        "restitution": 0.4,
+        "friction": 0.5
+      }
     },
     {
-      "mesh_index": 0, "material_set_index": 0,
-      "position": [0.0, 1.0, 20.0],
-      "rotation": [0.0, 0.0, 0.0, 1.0],
-      "scale": [40.0, 2.0, 1.0],
-      "rigid_body": { "body_type": "static" },
-      "collider": { "half_extents": [20.0, 1.0, 0.5], "restitution": 0.4, "friction": 0.7 }
+      "mesh_index": 0,
+      "material_set_index": 0,
+      "position": [
+        0.0,
+        1.0,
+        20.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        40.0,
+        2.0,
+        1.0
+      ],
+      "rigid_body": {
+        "body_type": "static"
+      },
+      "collider": {
+        "half_extents": [
+          20.0,
+          1.0,
+          0.5
+        ],
+        "restitution": 0.4,
+        "friction": 0.5
+      }
     },
     {
-      "mesh_index": 0, "material_set_index": 0,
-      "position": [0.0, 1.0, -20.0],
-      "rotation": [0.0, 0.0, 0.0, 1.0],
-      "scale": [40.0, 2.0, 1.0],
-      "rigid_body": { "body_type": "static" },
-      "collider": { "half_extents": [20.0, 1.0, 0.5], "restitution": 0.4, "friction": 0.7 }
+      "mesh_index": 0,
+      "material_set_index": 0,
+      "position": [
+        0.0,
+        1.0,
+        -20.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        40.0,
+        2.0,
+        1.0
+      ],
+      "rigid_body": {
+        "body_type": "static"
+      },
+      "collider": {
+        "half_extents": [
+          20.0,
+          1.0,
+          0.5
+        ],
+        "restitution": 0.4,
+        "friction": 0.5
+      }
     },
     {
-      "mesh_index": 0, "material_set_index": 0,
-      "position": [20.0, 1.0, 0.0],
-      "rotation": [0.0, 0.0, 0.0, 1.0],
-      "scale": [1.0, 2.0, 40.0],
-      "rigid_body": { "body_type": "static" },
-      "collider": { "half_extents": [0.5, 1.0, 20.0], "restitution": 0.4, "friction": 0.7 }
+      "mesh_index": 0,
+      "material_set_index": 0,
+      "position": [
+        20.0,
+        1.0,
+        0.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        2.0,
+        40.0
+      ],
+      "rigid_body": {
+        "body_type": "static"
+      },
+      "collider": {
+        "half_extents": [
+          0.5,
+          1.0,
+          20.0
+        ],
+        "restitution": 0.4,
+        "friction": 0.5
+      }
     },
     {
-      "mesh_index": 0, "material_set_index": 0,
-      "position": [-20.0, 1.0, 0.0],
-      "rotation": [0.0, 0.0, 0.0, 1.0],
-      "scale": [1.0, 2.0, 40.0],
-      "rigid_body": { "body_type": "static" },
-      "collider": { "half_extents": [0.5, 1.0, 20.0], "restitution": 0.4, "friction": 0.7 }
+      "mesh_index": 0,
+      "material_set_index": 0,
+      "position": [
+        -20.0,
+        1.0,
+        0.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        2.0,
+        40.0
+      ],
+      "rigid_body": {
+        "body_type": "static"
+      },
+      "collider": {
+        "half_extents": [
+          0.5,
+          1.0,
+          20.0
+        ],
+        "restitution": 0.4,
+        "friction": 0.5
+      }
     },
     {
-      "mesh_index": 0, "material_set_index": 0,
-      "position": [5.0, 0.75, 5.0],
-      "rotation": [0.0, 0.0, 0.0, 1.0],
-      "scale": [2.0, 1.5, 2.0],
-      "rigid_body": { "body_type": "static" },
-      "collider": { "half_extents": [1.0, 0.75, 1.0], "restitution": 0.4, "friction": 0.7 }
+      "mesh_index": 0,
+      "material_set_index": 0,
+      "position": [
+        5.0,
+        0.75,
+        5.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        2.0,
+        1.5,
+        2.0
+      ],
+      "rigid_body": {
+        "body_type": "static"
+      },
+      "collider": {
+        "half_extents": [
+          1.0,
+          0.75,
+          1.0
+        ],
+        "restitution": 0.4,
+        "friction": 0.5
+      }
     },
     {
-      "mesh_index": 0, "material_set_index": 0,
-      "position": [-6.0, 0.5, 3.0],
-      "rotation": [0.0, 0.0, 0.0, 1.0],
-      "scale": [3.0, 1.0, 1.0],
-      "rigid_body": { "body_type": "static" },
-      "collider": { "half_extents": [1.5, 0.5, 0.5], "restitution": 0.4, "friction": 0.7 }
+      "mesh_index": 0,
+      "material_set_index": 0,
+      "position": [
+        -6.0,
+        0.5,
+        3.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        3.0,
+        1.0,
+        1.0
+      ],
+      "rigid_body": {
+        "body_type": "static"
+      },
+      "collider": {
+        "half_extents": [
+          1.5,
+          0.5,
+          0.5
+        ],
+        "restitution": 0.4,
+        "friction": 0.5
+      }
     },
     {
-      "mesh_index": 0, "material_set_index": 0,
-      "position": [3.0, 0.5, 3.0],
-      "rotation": [0.0, 0.0, 0.0, 1.0],
-      "scale": [1.0, 1.0, 1.0],
-      "rigid_body": { "body_type": "dynamic" },
-      "collider": { "half_extents": [0.5, 0.5, 0.5], "restitution": 0.5, "friction": 0.5 }
+      "mesh_index": 0,
+      "material_set_index": 0,
+      "position": [
+        2.9999986,
+        0.4987241,
+        2.999999
+      ],
+      "rotation": [
+        -0.0000018349483,
+        -2.6099812e-7,
+        0.0000017195467,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "rigid_body": {
+        "body_type": "dynamic"
+      },
+      "collider": {
+        "half_extents": [
+          0.5,
+          0.5,
+          0.5
+        ],
+        "restitution": 0.4,
+        "friction": 0.5
+      }
     },
     {
-      "mesh_index": 0, "material_set_index": 0,
-      "position": [-4.0, 0.5, 6.0],
-      "rotation": [0.0, 0.0, 0.0, 1.0],
-      "scale": [1.0, 1.0, 1.0],
-      "rigid_body": { "body_type": "dynamic" },
-      "collider": { "half_extents": [0.5, 0.5, 0.5], "restitution": 0.5, "friction": 0.5 }
+      "mesh_index": 0,
+      "material_set_index": 0,
+      "position": [
+        -4.0000033,
+        0.4987241,
+        5.999997
+      ],
+      "rotation": [
+        -0.000001484396,
+        -6.924309e-9,
+        0.0000013788023,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "rigid_body": {
+        "body_type": "dynamic"
+      },
+      "collider": {
+        "half_extents": [
+          0.5,
+          0.5,
+          0.5
+        ],
+        "restitution": 0.4,
+        "friction": 0.5
+      }
     },
     {
-      "mesh_index": 0, "material_set_index": 0,
-      "position": [6.0, 0.5, -2.0],
-      "rotation": [0.0, 0.0, 0.0, 1.0],
-      "scale": [1.0, 1.0, 1.0],
-      "rigid_body": { "body_type": "dynamic" },
-      "collider": { "half_extents": [0.5, 0.5, 0.5], "restitution": 0.5, "friction": 0.5 }
+      "mesh_index": 0,
+      "material_set_index": 0,
+      "position": [
+        5.999998,
+        0.4987241,
+        -2.000001
+      ],
+      "rotation": [
+        -0.0000016743735,
+        4.3603072e-7,
+        0.0000016878515,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "rigid_body": {
+        "body_type": "dynamic"
+      },
+      "collider": {
+        "half_extents": [
+          0.5,
+          0.5,
+          0.5
+        ],
+        "restitution": 0.4,
+        "friction": 0.5
+      }
     },
     {
-      "mesh_index": 0, "material_set_index": 0,
-      "position": [-5.0, 0.5, -3.0],
-      "rotation": [0.0, 0.0, 0.0, 1.0],
-      "scale": [1.0, 1.0, 1.0],
-      "rigid_body": { "body_type": "dynamic" },
-      "collider": { "half_extents": [0.5, 0.5, 0.5], "restitution": 0.5, "friction": 0.5 }
+      "mesh_index": 0,
+      "material_set_index": 0,
+      "position": [
+        -4.9998274,
+        0.49795872,
+        -2.9995036
+      ],
+      "rotation": [
+        0.000023247672,
+        -0.000031703847,
+        0.00012518186,
+        0.99999994
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "rigid_body": {
+        "body_type": "dynamic"
+      },
+      "collider": {
+        "half_extents": [
+          0.5,
+          0.5,
+          0.5
+        ],
+        "restitution": 0.4,
+        "friction": 0.5
+      }
     },
     {
-      "mesh_index": 0, "material_set_index": 0,
-      "position": [-5.0, 1.5, -3.0],
-      "rotation": [0.0, 0.0, 0.0, 1.0],
-      "scale": [1.0, 1.0, 1.0],
-      "rigid_body": { "body_type": "dynamic" },
-      "collider": { "half_extents": [0.5, 0.5, 0.5], "restitution": 0.5, "friction": 0.5 }
+      "mesh_index": 0,
+      "material_set_index": 0,
+      "position": [
+        -4.9905696,
+        1.49545,
+        -2.9937155
+      ],
+      "rotation": [
+        0.000065604436,
+        -0.0037514293,
+        0.00039594338,
+        0.9999929
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "rigid_body": {
+        "body_type": "dynamic"
+      },
+      "collider": {
+        "half_extents": [
+          0.5,
+          0.5,
+          0.5
+        ],
+        "restitution": 0.4,
+        "friction": 0.5
+      }
     },
     {
-      "mesh_index": 0, "material_set_index": 0,
-      "position": [-5.0, 2.5, -3.0],
-      "rotation": [0.0, 0.0, 0.0, 1.0],
-      "scale": [1.0, 1.0, 1.0],
-      "rigid_body": { "body_type": "dynamic" },
-      "collider": { "half_extents": [0.5, 0.5, 0.5], "restitution": 0.5, "friction": 0.5 }
+      "mesh_index": 0,
+      "material_set_index": 0,
+      "position": [
+        -4.9856377,
+        2.4939253,
+        -2.9931202
+      ],
+      "rotation": [
+        0.00008294456,
+        -0.005673317,
+        0.00059775735,
+        0.9999837
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "rigid_body": {
+        "body_type": "dynamic"
+      },
+      "collider": {
+        "half_extents": [
+          0.5,
+          0.5,
+          0.5
+        ],
+        "restitution": 0.4,
+        "friction": 0.5
+      }
+    },
+    {
+      "mesh_index": 0,
+      "material_set_index": 0,
+      "position": [
+        0.4162382,
+        0.5,
+        -0.28640175
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "rigid_body": {
+        "body_type": "static"
+      },
+      "collider": {
+        "half_extents": [
+          0.5,
+          0.5,
+          0.5
+        ],
+        "restitution": 0.4,
+        "friction": 0.5
+      }
+    },
+    {
+      "mesh_index": 0,
+      "material_set_index": 0,
+      "position": [
+        -0.18716866,
+        0.6,
+        -2.9610603
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        4.0,
+        1.2,
+        0.3
+      ],
+      "rigid_body": {
+        "body_type": "static"
+      },
+      "collider": {
+        "half_extents": [
+          2.0,
+          0.6,
+          0.15
+        ],
+        "restitution": 0.4,
+        "friction": 0.5
+      }
+    },
+    {
+      "mesh_index": 0,
+      "material_set_index": 0,
+      "position": [
+        -0.122843266,
+        0.15,
+        -3.3466463
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        8.0,
+        0.3,
+        1.5
+      ],
+      "rigid_body": {
+        "body_type": "static"
+      },
+      "collider": {
+        "half_extents": [
+          4.0,
+          0.15,
+          0.75
+        ],
+        "restitution": 0.4,
+        "friction": 0.5
+      }
     }
   ],
-  "placed_props": [],
+  "placed_props": [
+    {
+      "prop_id": "cube_static",
+      "model": "",
+      "position": [
+        0.4162382,
+        0.5,
+        -0.28640175
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    {
+      "prop_id": "wall_low",
+      "model": "",
+      "position": [
+        -0.18716866,
+        0.6,
+        -2.9610603
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        4.0,
+        1.2,
+        0.3
+      ]
+    },
+    {
+      "prop_id": "platform_narrow",
+      "model": "",
+      "position": [
+        -0.122843266,
+        0.15,
+        -3.3466463
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        8.0,
+        0.3,
+        1.5
+      ]
+    }
+  ],
   "directional_light": {
-    "direction": [0.4, -1.0, -0.6],
-    "color": [1.0, 1.0, 1.0],
-    "intensity": 1.5
+    "direction": [
+      0.8808287,
+      0.16638651,
+      0.44323403
+    ],
+    "color": [
+      0.8460422,
+      0.4101913,
+      0.16414908
+    ],
+    "intensity": 0.61268467
   },
   "point_lights": [
     {
-      "position": [8.0, 4.0, 8.0],
-      "color": [1.0, 0.9, 0.7],
+      "position": [
+        8.0,
+        4.0,
+        8.0
+      ],
+      "color": [
+        1.0,
+        0.9,
+        0.7
+      ],
       "intensity": 6.0,
       "radius": 20.0
     },
     {
-      "position": [-8.0, 4.0, -8.0],
-      "color": [0.7, 0.8, 1.0],
+      "position": [
+        -8.0,
+        4.0,
+        -8.0
+      ],
+      "color": [
+        0.7,
+        0.8,
+        1.0
+      ],
       "intensity": 4.0,
       "radius": 20.0
+    },
+    {
+      "position": [
+        4.0,
+        3.0,
+        4.0
+      ],
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "intensity": 0.0,
+      "radius": 15.0
+    },
+    {
+      "position": [
+        -4.0,
+        3.0,
+        4.0
+      ],
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "intensity": 0.0,
+      "radius": 15.0
+    },
+    {
+      "position": [
+        4.0,
+        3.0,
+        -4.0
+      ],
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "intensity": 0.0,
+      "radius": 15.0
+    },
+    {
+      "position": [
+        -4.0,
+        3.0,
+        -4.0
+      ],
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "intensity": 0.0,
+      "radius": 15.0
     }
   ],
   "scripts": []

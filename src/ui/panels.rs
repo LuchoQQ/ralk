@@ -1,4 +1,7 @@
-use crate::scene::{DirectionalLight, PointLight, Transform};
+use crate::scene::{
+    DirectionalLight, EasingType, MaterialOverride, MeshRenderer, ParticleEmitter,
+    PointLight, PropertyAnimator, Transform, TriggerAction, TriggerShape, TriggerZone,
+};
 use super::{
     AudioUiState, DayNightUiState, DebugSettings, EditorUiState, FrameStats,
     GameHudState, GameStateKind, MainMenuUiState, PhysicsUiState, PropsUiState,
@@ -462,6 +465,104 @@ pub fn sidebar(
                     }
                 });
 
+                // ---- Scene Tree (Fase 38) ----------------------------------
+                ui.collapsing("Scene Tree", |ui| {
+                    scene_tree_content(ui, world, editor);
+                });
+
+                // ---- Material Editor (Fase 44) -----------------------------
+                // Aparece para cualquier Mesh seleccionado; permite añadir override.
+                if let Some(sel) = editor.selected_entity {
+                    if world.get::<&MeshRenderer>(sel).is_ok() {
+                        ui.collapsing("Material Override", |ui| {
+                            if world.get::<&MaterialOverride>(sel).is_ok() {
+                                material_editor_content(ui, world, sel);
+                            } else {
+                                ui.label(egui::RichText::new("Sin override").color(egui::Color32::from_gray(150)));
+                                if ui.button("+ Añadir Material Override").clicked() {
+                                    let _ = world.insert_one(sel, MaterialOverride {
+                                        base_color_factor: None,
+                                        metallic_factor: None,
+                                        roughness_factor: None,
+                                        emissive_factor: None,
+                                        emissive_intensity: None,
+                                        normal_scale: None,
+                                        uv_scale: None,
+                                    });
+                                }
+                            }
+                        });
+                    }
+                }
+
+                // ---- Particle Emitter (Fase 40) ----------------------------
+                if let Some(sel) = editor.selected_entity {
+                    ui.collapsing("Particle Emitter", |ui| {
+                        if world.get::<&ParticleEmitter>(sel).is_ok() {
+                            particle_emitter_content(ui, world, sel);
+                        } else {
+                            ui.label(egui::RichText::new("Sin emisor").color(egui::Color32::from_gray(150)));
+                            ui.horizontal(|ui| {
+                                if ui.button("+ Fuego").clicked() {
+                                    let _ = world.insert_one(sel, ParticleEmitter::fire_preset());
+                                }
+                                if ui.button("+ Humo").clicked() {
+                                    let _ = world.insert_one(sel, ParticleEmitter::smoke_preset());
+                                }
+                            });
+                        }
+                    });
+                }
+
+                // ---- Property Animator (Fase 41) ---------------------------
+                if let Some(sel) = editor.selected_entity {
+                    ui.collapsing("Animator", |ui| {
+                        if world.get::<&PropertyAnimator>(sel).is_ok() {
+                            property_animator_content(ui, world, sel);
+                        } else {
+                            ui.label(egui::RichText::new("Sin animador").color(egui::Color32::from_gray(150)));
+                            if ui.button("+ Añadir Animator (puerta)").clicked() {
+                                let _ = world.insert_one(sel, PropertyAnimator {
+                                    from_rot_y: 0.0,
+                                    to_rot_y: std::f32::consts::FRAC_PI_2,
+                                    duration: 1.0,
+                                    elapsed: 0.0,
+                                    easing: EasingType::EaseInOut,
+                                    playing: false,
+                                    loop_anim: false,
+                                    reverse: false,
+                                });
+                            }
+                        }
+                    });
+                }
+
+                // ---- Trigger Zone (Fase 42) --------------------------------
+                if let Some(sel) = editor.selected_entity {
+                    ui.collapsing("Trigger Zone", |ui| {
+                        if world.get::<&TriggerZone>(sel).is_ok() {
+                            trigger_zone_content(ui, world, sel);
+                        } else {
+                            ui.label(egui::RichText::new("Sin trigger").color(egui::Color32::from_gray(150)));
+                            if ui.button("+ Añadir Trigger Zone (caja)").clicked() {
+                                let _ = world.insert_one(sel, TriggerZone {
+                                    shape: TriggerShape::Box,
+                                    size: glam::Vec3::new(2.0, 2.0, 2.0),
+                                    on_enter: Some(TriggerAction::PlaySound {
+                                        path: "assets/audio/click.wav".into(),
+                                        volume: 0.5,
+                                    }),
+                                    on_exit: None,
+                                    once: false,
+                                    triggered: false,
+                                    player_inside: false,
+                                    visible_in_editor: true,
+                                });
+                            }
+                        }
+                    });
+                }
+
                 // ---- Props catalog (Fase 36) --------------------------------
                 ui.collapsing("Props (Tab)", |ui| {
                     props_panel_content(ui, props);
@@ -597,4 +698,166 @@ fn props_panel_content(ui: &mut egui::Ui, props: &mut PropsUiState) {
             }
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// Scene Tree (Fase 38) — flat list with parent indicator
+// ---------------------------------------------------------------------------
+fn scene_tree_content(ui: &mut egui::Ui, world: &mut hecs::World, editor: &mut EditorUiState) {
+    use crate::scene::Parent;
+
+    // Build list with descriptive labels.
+    let mut entries: Vec<(hecs::Entity, bool, String)> = world
+        .query::<()>()
+        .iter()
+        .map(|(e, ())| {
+            let has_parent = world.get::<&Parent>(e).is_ok();
+            // Build a human-readable label from components present.
+            let kind = if world.get::<&DirectionalLight>(e).is_ok() {
+                "DirLight"
+            } else if world.get::<&PointLight>(e).is_ok() {
+                "PointLight"
+            } else if world.get::<&ParticleEmitter>(e).is_ok() {
+                "Particles"
+            } else if world.get::<&MeshRenderer>(e).is_ok() {
+                "Mesh"
+            } else {
+                "Entity"
+            };
+            // Show position if it has a Transform.
+            let pos_suffix = if let Ok(t) = world.get::<&Transform>(e) {
+                format!(" ({:.1},{:.1},{:.1})", t.position.x, t.position.y, t.position.z)
+            } else {
+                String::new()
+            };
+            let indent = if has_parent { "  └ " } else { "" };
+            let label = format!("{}[{}] {}{}", indent, e.id(), kind, pos_suffix);
+            (e, has_parent, label)
+        })
+        .collect();
+    entries.sort_by_key(|(e, _, _)| e.id());
+
+    egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+        for (entity, _, label) in &entries {
+            let selected = editor.selected_entity == Some(*entity);
+            if ui.selectable_label(selected, label).clicked() {
+                editor.selected_entity = Some(*entity);
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Material Editor (Fase 44) — roughness/metallic/color/emissive sliders
+// ---------------------------------------------------------------------------
+fn material_editor_content(ui: &mut egui::Ui, world: &mut hecs::World, entity: hecs::Entity) {
+    let Ok(mut ov) = world.get::<&mut MaterialOverride>(entity) else { return };
+
+    ui.label("Base Color");
+    let mut has_color = ov.base_color_factor.is_some();
+    if ui.checkbox(&mut has_color, "Override").changed() {
+        ov.base_color_factor = if has_color { Some([1.0, 1.0, 1.0, 1.0]) } else { None };
+    }
+    if let Some(ref mut c) = ov.base_color_factor {
+        ui.horizontal(|ui| {
+            ui.add(egui::DragValue::new(&mut c[0]).clamp_range(0.0..=1.0).speed(0.01).prefix("R:"));
+            ui.add(egui::DragValue::new(&mut c[1]).clamp_range(0.0..=1.0).speed(0.01).prefix("G:"));
+            ui.add(egui::DragValue::new(&mut c[2]).clamp_range(0.0..=1.0).speed(0.01).prefix("B:"));
+        });
+    }
+
+    ui.add_space(4.0);
+    let mut has_metallic = ov.metallic_factor.is_some();
+    if ui.checkbox(&mut has_metallic, "Metallic").changed() {
+        ov.metallic_factor = if has_metallic { Some(0.0) } else { None };
+    }
+    if let Some(ref mut m) = ov.metallic_factor {
+        ui.add(egui::Slider::new(m, 0.0..=1.0).text("Metallic"));
+    }
+
+    let mut has_roughness = ov.roughness_factor.is_some();
+    if ui.checkbox(&mut has_roughness, "Roughness").changed() {
+        ov.roughness_factor = if has_roughness { Some(0.5) } else { None };
+    }
+    if let Some(ref mut r) = ov.roughness_factor {
+        ui.add(egui::Slider::new(r, 0.0..=1.0).text("Roughness"));
+    }
+
+    ui.add_space(4.0);
+    let mut has_emissive = ov.emissive_factor.is_some();
+    if ui.checkbox(&mut has_emissive, "Emissive").changed() {
+        ov.emissive_factor = if has_emissive { Some([0.0, 0.0, 0.0]) } else { None };
+        ov.emissive_intensity = if has_emissive { Some(1.0) } else { None };
+    }
+    if let Some(ref mut em) = ov.emissive_factor {
+        ui.horizontal(|ui| {
+            ui.add(egui::DragValue::new(&mut em[0]).clamp_range(0.0..=1.0).speed(0.01).prefix("R:"));
+            ui.add(egui::DragValue::new(&mut em[1]).clamp_range(0.0..=1.0).speed(0.01).prefix("G:"));
+            ui.add(egui::DragValue::new(&mut em[2]).clamp_range(0.0..=1.0).speed(0.01).prefix("B:"));
+        });
+    }
+    if let Some(ref mut ei) = ov.emissive_intensity {
+        ui.add(egui::Slider::new(ei, 0.0..=10.0).text("Intensity"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Particle Emitter Editor (Fase 40)
+// ---------------------------------------------------------------------------
+fn particle_emitter_content(ui: &mut egui::Ui, world: &mut hecs::World, entity: hecs::Entity) {
+    let Ok(mut em) = world.get::<&mut ParticleEmitter>(entity) else { return };
+
+    ui.checkbox(&mut em.enabled, "Enabled");
+    ui.add(egui::Slider::new(&mut em.spawn_rate, 0.0..=200.0).text("Spawn Rate"));
+    ui.add(egui::Slider::new(&mut em.lifetime_min, 0.1..=5.0).text("Life Min"));
+    ui.add(egui::Slider::new(&mut em.lifetime_max, 0.1..=5.0).text("Life Max"));
+    ui.add(egui::Slider::new(&mut em.start_size_min, 0.01..=1.0).text("Size Min"));
+    ui.add(egui::Slider::new(&mut em.start_size_max, 0.01..=1.0).text("Size Max"));
+    ui.label(format!("Live particles: {}", em.particles.len()));
+}
+
+// ---------------------------------------------------------------------------
+// Property Animator Editor (Fase 41)
+// ---------------------------------------------------------------------------
+fn property_animator_content(ui: &mut egui::Ui, world: &mut hecs::World, entity: hecs::Entity) {
+    let Ok(mut pa) = world.get::<&mut PropertyAnimator>(entity) else { return };
+
+    ui.add(egui::Slider::new(&mut pa.from_rot_y, -std::f32::consts::PI..=std::f32::consts::PI).text("From Y (rad)"));
+    ui.add(egui::Slider::new(&mut pa.to_rot_y, -std::f32::consts::PI..=std::f32::consts::PI).text("To Y (rad)"));
+    ui.add(egui::Slider::new(&mut pa.duration, 0.1..=5.0).text("Duration (s)"));
+    ui.checkbox(&mut pa.loop_anim, "Loop");
+    ui.checkbox(&mut pa.reverse, "Reverse");
+
+    ui.horizontal(|ui| {
+        if ui.button("Play").clicked() {
+            pa.playing = true;
+            pa.elapsed = 0.0;
+        }
+        if ui.button("Stop").clicked() {
+            pa.playing = false;
+        }
+    });
+    ui.add(egui::ProgressBar::new(pa.progress()).text("Progress"));
+}
+
+// ---------------------------------------------------------------------------
+// Trigger Zone Editor (Fase 42)
+// ---------------------------------------------------------------------------
+fn trigger_zone_content(ui: &mut egui::Ui, world: &mut hecs::World, entity: hecs::Entity) {
+    let Ok(mut tz) = world.get::<&mut TriggerZone>(entity) else { return };
+
+    ui.horizontal(|ui| {
+        ui.label("Size:");
+        ui.add(egui::DragValue::new(&mut tz.size.x).speed(0.05).prefix("X:"));
+        ui.add(egui::DragValue::new(&mut tz.size.y).speed(0.05).prefix("Y:"));
+        ui.add(egui::DragValue::new(&mut tz.size.z).speed(0.05).prefix("Z:"));
+    });
+    ui.checkbox(&mut tz.once, "Fire Once");
+    ui.checkbox(&mut tz.visible_in_editor, "Visible");
+    ui.label(format!("Player inside: {}", tz.player_inside));
+    ui.label(format!("Triggered: {}", tz.triggered));
+    if ui.button("Reset").clicked() {
+        tz.triggered = false;
+        tz.player_inside = false;
+    }
 }

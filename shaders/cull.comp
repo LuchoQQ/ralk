@@ -14,16 +14,19 @@ layout(set = 0, binding = 0) uniform LightingUbo {
     vec4 frustum_planes[6];
 } ubo;
 
-// Must match InstanceData in Rust (112 bytes, std430).
+// Must match InstanceData in Rust (160 bytes, std430) — Fase 44 extended.
 struct InstanceData {
-    mat4  model;
-    vec4  world_min;   // pre-transformed world-space AABB min (xyz, w unused)
-    vec4  world_max;   // pre-transformed world-space AABB max (xyz, w unused)
-    uint  mesh_index;
-    uint  _pad0;
-    uint  _pad1;
-    uint  _pad2;
-};
+    mat4  model;          // offset   0
+    vec4  world_min;      // offset  64
+    vec4  world_max;      // offset  80
+    uint  mesh_index;     // offset  96
+    uint  override_flags; // offset 100 (Fase 44)
+    uint  _pad1;          // offset 104
+    uint  _pad2;          // offset 108
+    vec4  override_color;   // offset 112
+    vec4  override_mr;      // offset 128
+    vec4  override_emissive;// offset 144
+};  // total 160 bytes
 
 // One LOD level: offset + count into the shared mega index buffer.
 struct LodLevel {

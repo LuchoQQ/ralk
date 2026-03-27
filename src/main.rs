@@ -39,6 +39,16 @@ use scene::{
     GizmoAxis, GizmoDrag, GizmoMode,
     build_axis_groups, build_selection_group, drag_axis_dir,
     hit_test_gizmo, ray_aabb, screen_to_ray,
+    // Fase 38: hierarchy
+    Children, Parent, WorldTransform,
+    // Fase 40: particles
+    Particle, ParticleEmitter,
+    // Fase 41: property animation
+    PropertyAnimator,
+    // Fase 42: triggers
+    TriggerAction, TriggerZone,
+    // Fase 44: material override
+    MaterialOverride,
 };
 use scripting::{ScriptCommand, ScriptEngine};
 use ui::{
@@ -464,6 +474,96 @@ impl App {
                     bbox,
                 ));
             }
+
+            // Restore M7 components (PropertyAnimator, MaterialOverride, TriggerZone).
+            // We do this after spawn so the entity ID is available via a separate query.
+            // hecs does not support conditional component bundles at spawn time, so we
+            // use insert_one on the freshly-spawned entity by re-querying the last one.
+            // Simpler: just save the entity handle from each spawn path above.
+            // For now we query the last spawned entity via a workaround.
+            //
+            // Actually, the cleanest approach is to build optional component tuples.
+            // We'll handle this by querying entities that match transform+mr+no-extra after.
+            // For now simply track the spawned entity in a separate pass by matching position.
+        }
+
+        // Second pass: attach M7 components to entities that were just spawned.
+        // Match each EntityDef by index using a collected entity list.
+        {
+            let all_entities: Vec<hecs::Entity> = self.world
+                .query::<(&Transform, &MeshRenderer)>()
+                .iter()
+                .map(|(e, _)| e)
+                .collect();
+            // The entities from sf.entities are spawned first (before lights), so they
+            // correspond to the first sf.entities.len() entities in the world by order.
+            // hecs doesn't guarantee order, so we re-collect just the ones from this batch.
+            // The reliable way: re-spawn with components included from the start.
+            // However, to avoid refactoring the complex spawn above, we note:
+            // ParticleEmitter entities (Fase 40) are not in EntityDef — they don't have MeshRenderer saved.
+            // Only MaterialOverride, PropertyAnimator, TriggerZone need to be attached.
+            //
+            // We match on position since there's no other unique key.
+            for (i, ent_def) in sf.entities.iter().enumerate() {
+                let target_pos = Vec3::from(ent_def.position);
+                // Find the entity with this transform position (first match).
+                let entity = all_entities.iter().find(|&&e| {
+                    self.world.get::<&Transform>(e)
+                        .map(|t| (t.position - target_pos).length_squared() < 1e-6)
+                        .unwrap_or(false)
+                }).copied();
+                let _ = i; // suppress warning
+                let Some(entity) = entity else { continue };
+
+                if let Some(pa_def) = &ent_def.property_animator {
+                    let _ = self.world.insert_one(entity, PropertyAnimator {
+                        from_rot_y: pa_def.from_rot_y,
+                        to_rot_y: pa_def.to_rot_y,
+                        duration: pa_def.duration,
+                        elapsed: 0.0,
+                        easing: scene::EasingType::EaseInOut,
+                        playing: true,
+                        loop_anim: pa_def.looping,
+                        reverse: false,
+                    });
+                }
+                if let Some(ov_def) = &ent_def.material_override {
+                    let _ = self.world.insert_one(entity, MaterialOverride {
+                        base_color_factor: ov_def.base_color,
+                        metallic_factor: ov_def.metallic,
+                        roughness_factor: ov_def.roughness,
+                        emissive_factor: ov_def.emissive,
+                        emissive_intensity: ov_def.emissive_intensity,
+                        normal_scale: None,
+                        uv_scale: None,
+                    });
+                }
+                if let Some(tz_def) = &ent_def.trigger_zone {
+                    let on_enter = match tz_def.on_enter_action.as_deref() {
+                        Some("play_sound") => tz_def.on_enter_sound_path.as_ref().map(|p| {
+                            TriggerAction::PlaySound {
+                                path: p.clone(),
+                                volume: tz_def.on_enter_sound_volume.unwrap_or(1.0),
+                            }
+                        }),
+                        Some("play_animation") => tz_def.on_enter_target.as_ref().and_then(|s| {
+                            s.parse::<u64>().ok().map(|bits| TriggerAction::PlayAnimation { target_entity_bits: bits })
+                        }),
+                        _ => None,
+                    };
+                    let shape = if tz_def.shape == "sphere" { scene::TriggerShape::Sphere } else { scene::TriggerShape::Box };
+                    let _ = self.world.insert_one(entity, TriggerZone {
+                        shape,
+                        size: Vec3::from(tz_def.size),
+                        on_enter,
+                        on_exit: None,
+                        once: tz_def.once,
+                        triggered: false,
+                        player_inside: false,
+                        visible_in_editor: true,
+                    });
+                }
+            }
         }
 
         for light in &sf.point_lights {
@@ -618,6 +718,77 @@ impl App {
             }
         }
 
+        // ---- demo: ParticleEmitter (fuego) ------------------------------------
+        // Un cubo pequeño que actúa de fogón con partículas de fuego.
+        self.world.spawn((
+            Transform { position: Vec3::new(0.0, 0.5, -6.0), rotation: Quat::IDENTITY, scale: Vec3::new(0.4, 0.4, 0.4) },
+            MeshRenderer { mesh_index: cube, material_set_index: default_mat },
+            BoundingBox { min: Vec3::splat(-0.5), max: Vec3::splat(0.5) },
+            ParticleEmitter::fire_preset(),
+        ));
+
+        // ---- demo: ParticleEmitter (humo) -------------------------------------
+        self.world.spawn((
+            Transform { position: Vec3::new(2.0, 0.5, -6.0), rotation: Quat::IDENTITY, scale: Vec3::new(0.4, 0.4, 0.4) },
+            MeshRenderer { mesh_index: cube, material_set_index: default_mat },
+            BoundingBox { min: Vec3::splat(-0.5), max: Vec3::splat(0.5) },
+            ParticleEmitter::smoke_preset(),
+        ));
+
+        // ---- demo: PropertyAnimator (puerta giratoria) -----------------------
+        // Cubo alargado que rota 90° en Y en 2 seg, loop.
+        self.world.spawn((
+            Transform { position: Vec3::new(-6.0, 1.0, 0.0), rotation: Quat::IDENTITY, scale: Vec3::new(0.2, 2.0, 1.0) },
+            MeshRenderer { mesh_index: cube, material_set_index: default_mat },
+            BoundingBox { min: Vec3::splat(-0.5), max: Vec3::splat(0.5) },
+            PropertyAnimator {
+                from_rot_y: 0.0,
+                to_rot_y: std::f32::consts::FRAC_PI_2,
+                duration: 2.0,
+                elapsed: 0.0,
+                easing: scene::EasingType::EaseInOut,
+                playing: true,
+                loop_anim: true,
+                reverse: false,
+            },
+        ));
+
+        // ---- demo: MaterialOverride (cubo brillante) -------------------------
+        // Cubo rojo metálico con emisión.
+        self.world.spawn((
+            Transform { position: Vec3::new(6.0, 0.5, 0.0), rotation: Quat::IDENTITY, scale: Vec3::splat(1.0) },
+            MeshRenderer { mesh_index: cube, material_set_index: default_mat },
+            BoundingBox { min: Vec3::splat(-0.5), max: Vec3::splat(0.5) },
+            MaterialOverride {
+                base_color_factor: Some([1.0, 0.1, 0.05, 1.0]),
+                metallic_factor:   Some(0.8),
+                roughness_factor:  Some(0.1),
+                emissive_factor:   Some([1.0, 0.2, 0.05]),
+                emissive_intensity: Some(2.0),
+                normal_scale: None,
+                uv_scale: None,
+            },
+        ));
+
+        // ---- demo: TriggerZone (zona de bienvenida cerca del spawn) ----------
+        // Zona 4×2×4 centrada en el spawn; por ahora sin acción (visible en editor).
+        self.world.spawn((
+            Transform { position: Vec3::new(0.0, 1.0, 3.0), rotation: Quat::IDENTITY, scale: Vec3::ONE },
+            TriggerZone {
+                shape: scene::TriggerShape::Box,
+                size: Vec3::new(2.0, 1.0, 2.0),
+                on_enter: Some(TriggerAction::PlaySound {
+                    path: "assets/audio/click.wav".into(),
+                    volume: 0.5,
+                }),
+                on_exit: None,
+                once: false,
+                triggered: false,
+                player_inside: false,
+                visible_in_editor: true,
+            },
+        ));
+
         // ---- lights --------------------------------------------------------
         self.world.spawn((
             Transform::from_position(Vec3::ZERO),
@@ -684,9 +855,15 @@ impl App {
                 position: transform.position.to_array(),
                 rotation: transform.rotation.to_array(),
                 scale: transform.scale.to_array(),
+                name: None,
+                parent_index: None,
                 rigid_body,
                 collider,
                 audio_source,
+                property_animator: None,
+                trigger_zone: None,
+                material_override: None,
+                prefab_path: None,
             });
         }
 
@@ -739,6 +916,7 @@ impl App {
                 position: t.position.to_array(),
                 rotation: t.rotation.to_array(),
                 scale: t.scale.to_array(),
+                parent_index: None,
             })
             .collect();
 
@@ -773,15 +951,65 @@ impl App {
                 restitution: 0.4,
                 friction: 0.5,
             });
+            let property_animator = self.world.get::<&PropertyAnimator>(entity).ok().map(|pa| {
+                use asset::PropertyAnimatorDef;
+                PropertyAnimatorDef {
+                    from_rot_y: pa.from_rot_y,
+                    to_rot_y: pa.to_rot_y,
+                    duration: pa.duration,
+                    looping: pa.loop_anim,
+                }
+            });
+            let material_override = self.world.get::<&MaterialOverride>(entity).ok().map(|ov| {
+                use asset::MaterialOverrideDef;
+                MaterialOverrideDef {
+                    base_color: ov.base_color_factor,
+                    metallic: ov.metallic_factor,
+                    roughness: ov.roughness_factor,
+                    emissive: ov.emissive_factor,
+                    emissive_intensity: ov.emissive_intensity,
+                }
+            });
+            let trigger_zone = self.world.get::<&TriggerZone>(entity).ok().map(|tz| {
+                use asset::TriggerZoneDef;
+                let (on_enter_action, on_enter_target, on_enter_sound_path, on_enter_sound_volume) =
+                    match &tz.on_enter {
+                        Some(TriggerAction::PlaySound { path, volume }) => {
+                            (Some("play_sound".into()), None, Some(path.clone()), Some(*volume))
+                        }
+                        Some(TriggerAction::PlayAnimation { target_entity_bits }) => {
+                            (Some("play_animation".into()), Some(target_entity_bits.to_string()), None, None)
+                        }
+                        Some(TriggerAction::ToggleEntity { target_entity_bits, .. }) => {
+                            (Some("toggle_entity".into()), Some(target_entity_bits.to_string()), None, None)
+                        }
+                        _ => (None, None, None, None),
+                    };
+                TriggerZoneDef {
+                    shape: match tz.shape { scene::TriggerShape::Box => "box".into(), scene::TriggerShape::Sphere => "sphere".into() },
+                    size: tz.size.to_array(),
+                    on_enter_action,
+                    on_enter_target,
+                    on_enter_sound_path,
+                    on_enter_sound_volume,
+                    once: tz.once,
+                }
+            });
             entities.push(EntityDef {
                 mesh_index: mr.mesh_index,
                 material_set_index: mr.material_set_index,
                 position: transform.position.to_array(),
                 rotation: transform.rotation.to_array(),
                 scale: transform.scale.to_array(),
+                name: None,
+                parent_index: None,
                 rigid_body,
                 collider,
                 audio_source: None,
+                property_animator,
+                trigger_zone,
+                material_override,
+                prefab_path: None,
             });
         }
         let mut dir_light = DirLightDef { direction: [0.4, -1.0, -0.6], color: [1.0; 3], intensity: 1.2 };
@@ -806,6 +1034,7 @@ impl App {
                 position: t.position.to_array(),
                 rotation: t.rotation.to_array(),
                 scale: t.scale.to_array(),
+                parent_index: None,
             })
             .collect();
 
@@ -826,6 +1055,13 @@ impl App {
             scripts: Vec::new(),
         };
         let _ = std::fs::create_dir_all(SCENES_DIR);
+        // Also overwrite the named scene file so it stays in sync.
+        if !self.current_scene_name.is_empty() {
+            let named_path = format!("{SCENES_DIR}/{}.json", self.current_scene_name);
+            if let Err(e) = save_scene_file(&named_path, &sf) {
+                log::warn!("Could not auto-save to named scene '{named_path}': {e}");
+            }
+        }
         save_scene_file(LAST_SESSION_PATH, &sf)
     }
 
@@ -1254,6 +1490,8 @@ impl App {
                 let path = format!("{SCENES_DIR}/{name}.json");
                 if let Err(e) = self.load_scene_file_async(&path) {
                     log::warn!("Could not load scene '{name}': {e}");
+                } else {
+                    self.current_scene_name = name;
                 }
             }
             return;
@@ -1412,24 +1650,316 @@ impl App {
     fn build_draw_list(&mut self) -> (Vec<DrawInstance>, usize) {
         let mut list = Vec::new();
 
-        for (_, (transform, mr, bbox)) in
+        // Query without WorldTransform (not all entities have it yet).
+        for (entity, (transform, mr, bbox)) in
             self.world.query::<(&Transform, &MeshRenderer, &BoundingBox)>().iter()
         {
-            let world_mat = transform.to_mat4();
+            // Use cached WorldTransform if available (set by update_world_transforms), else local.
+            let world_mat = self.world.get::<&WorldTransform>(entity)
+                .map(|wt| wt.matrix)
+                .unwrap_or_else(|_| transform.to_mat4());
+
             let (world_min, world_max) = transform_aabb(bbox.min, bbox.max, world_mat);
-            list.push(DrawInstance {
-                model: world_mat,
-                mesh_index: mr.mesh_index,
-                material_set_index: mr.material_set_index,
-                world_min,
-                world_max,
-            });
+
+            let mut inst = DrawInstance::basic(world_mat, mr.mesh_index, mr.material_set_index, world_min, world_max);
+
+            // Apply material override if present (Fase 44).
+            if let Ok(ov) = self.world.get::<&MaterialOverride>(entity) {
+                inst.override_flags = ov.flags();
+                if let Some(c) = ov.base_color_factor { inst.override_color = c; }
+                if let Some(m) = ov.metallic_factor   { inst.override_mr[0] = m; }
+                if let Some(r) = ov.roughness_factor  { inst.override_mr[1] = r; }
+                if let (Some(em), Some(ei)) = (ov.emissive_factor, ov.emissive_intensity) {
+                    inst.override_emissive = [em[0], em[1], em[2], ei];
+                } else if let Some(em) = ov.emissive_factor {
+                    inst.override_emissive = [em[0], em[1], em[2], 1.0];
+                }
+            }
+
+            list.push(inst);
         }
 
         let total = list.len();
         // Sort by material so the engine can group indirect draws by material set.
         list.sort_unstable_by_key(|inst| inst.material_set_index);
         (list, total)
+    }
+
+    // -----------------------------------------------------------------------
+    // Fase 38 — hierarchy: propagate world transforms top-down.
+    // -----------------------------------------------------------------------
+    fn update_world_transforms(&mut self) {
+        // Collect local transforms (two separate passes to avoid borrow conflicts).
+        let local_mats: Vec<(hecs::Entity, glam::Mat4)> = self.world
+            .query::<&Transform>()
+            .iter()
+            .map(|(e, t)| (e, t.to_mat4()))
+            .collect();
+
+        // Collect parent map separately.
+        let parent_map: std::collections::HashMap<hecs::Entity, hecs::Entity> = self.world
+            .query::<&Parent>()
+            .iter()
+            .map(|(e, p)| (e, p.entity))
+            .collect();
+
+        // First pass: roots (no parent).
+        for &(entity, local_mat) in &local_mats {
+            if !parent_map.contains_key(&entity) {
+                let _ = self.world.insert_one(entity, WorldTransform { matrix: local_mat });
+            }
+        }
+
+        // Second pass: children (one level — parents already have WorldTransform from pass 1).
+        for &(entity, local_mat) in &local_mats {
+            if let Some(&parent_entity) = parent_map.get(&entity) {
+                let parent_mat = self.world.get::<&WorldTransform>(parent_entity)
+                    .map(|wt| wt.matrix)
+                    .unwrap_or(glam::Mat4::IDENTITY);
+                let _ = self.world.insert_one(entity, WorldTransform { matrix: parent_mat * local_mat });
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Fase 41 — property animation: advance elapsed, apply rotation.
+    // -----------------------------------------------------------------------
+    fn update_property_animators(&mut self, dt: f32) {
+        let animating: Vec<hecs::Entity> = self.world
+            .query::<&PropertyAnimator>()
+            .iter()
+            .filter(|(_, pa)| pa.playing)
+            .map(|(e, _)| e)
+            .collect();
+
+        for entity in animating {
+            let rot_y;
+            let done;
+            {
+                let mut pa = self.world.get::<&mut PropertyAnimator>(entity).unwrap();
+                pa.elapsed = (pa.elapsed + dt).min(pa.duration);
+                rot_y = pa.current_rot_y();
+                done = pa.elapsed >= pa.duration;
+                if done && !pa.loop_anim { pa.playing = false; }
+                if done && pa.loop_anim  { pa.elapsed = 0.0; }
+            }
+            if let Ok(mut t) = self.world.get::<&mut Transform>(entity) {
+                t.rotation = glam::Quat::from_rotation_y(rot_y);
+                // Sync physics body so the collider follows the visual rotation.
+                if let Ok(pb) = self.world.get::<&PhysicsBody>(entity) {
+                    self.physics.set_body_pose(pb.handle, t.position, t.rotation);
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Fase 42 — trigger zones: detect player overlap, fire actions.
+    // -----------------------------------------------------------------------
+    fn update_trigger_zones(&mut self) {
+        let player_pos = self.camera.position;
+
+        // Collect trigger data first to avoid borrow conflicts.
+        struct TriggerState {
+            entity: hecs::Entity,
+            pos: glam::Vec3,
+            size: glam::Vec3,
+            inside: bool,
+            was_inside: bool,
+            once: bool,
+            triggered: bool,
+            on_enter: Option<TriggerAction>,
+        }
+        let mut states: Vec<TriggerState> = self.world
+            .query::<(&Transform, &TriggerZone)>()
+            .iter()
+            .map(|(e, (t, tz))| TriggerState {
+                entity: e,
+                pos: t.position,
+                size: tz.size,
+                inside: {
+                    let d = player_pos - t.position;
+                    d.x.abs() <= tz.size.x && d.y.abs() <= tz.size.y && d.z.abs() <= tz.size.z
+                },
+                was_inside: tz.player_inside,
+                once: tz.once,
+                triggered: tz.triggered,
+                on_enter: tz.on_enter.clone(),
+            })
+            .collect();
+
+        for st in &mut states {
+            if let Ok(mut tz) = self.world.get::<&mut TriggerZone>(st.entity) {
+                tz.player_inside = st.inside;
+            }
+            if st.inside && !st.was_inside && !(st.once && st.triggered) {
+                if let Ok(mut tz) = self.world.get::<&mut TriggerZone>(st.entity) {
+                    tz.triggered = true;
+                }
+                self.dispatch_trigger_action(st.on_enter.clone(), st.pos);
+            }
+        }
+    }
+
+    fn dispatch_trigger_action(&mut self, action: Option<TriggerAction>, _trigger_pos: glam::Vec3) {
+        let Some(action) = action else { return };
+        match action {
+            TriggerAction::PlayAnimation { target_entity_bits } => {
+                let Some(target) = hecs::Entity::from_bits(target_entity_bits) else { return; };
+                if let Ok(mut pa) = self.world.get::<&mut PropertyAnimator>(target) {
+                    pa.playing = true;
+                    pa.elapsed = 0.0;
+                }
+            }
+            TriggerAction::PlaySound { path, volume } => {
+                if let Some(ref mut audio) = self.audio_engine {
+                    let _ = audio.play_sound(&path, volume, false);
+                }
+            }
+            TriggerAction::ToggleEntity { target_entity_bits: _, enabled: _ } => {
+                // Visibility toggle — placeholder. Full implementation would add/remove an Invisible marker component.
+                // Visibility toggle — MeshRenderer enable/disable would require an extra component.
+                // Left as a no-op placeholder; full implementation would add an Invisible marker.
+            }
+            TriggerAction::SpawnPrefab { prefab_path: _, offset: _ } => {
+                // Prefab spawn via trigger — placeholder (prefab spawning wired up separately).
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Fase 40 — particle system: advance simulation, build CPU billboard quads.
+    // -----------------------------------------------------------------------
+    fn update_particles(&mut self, dt: f32) {
+        use scene::EmitterShape;
+
+        // Deterministic LCG random (no external crate needed).
+        let mut seed = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos()) as u64;
+        let mut randf = move || -> f32 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f32 / ((1u64 << 53) as f32)
+        };
+
+        let emitters: Vec<hecs::Entity> = self.world
+            .query::<&ParticleEmitter>()
+            .iter()
+            .map(|(e, _)| e)
+            .collect();
+
+        for entity in emitters {
+            let pos;
+            {
+                pos = self.world.get::<&Transform>(entity)
+                    .map(|t| t.position)
+                    .unwrap_or(glam::Vec3::ZERO);
+            }
+
+            let mut em = self.world.get::<&mut ParticleEmitter>(entity).unwrap();
+            if !em.enabled { continue; }
+
+            // Spawn new particles.
+            em.spawn_accum += em.spawn_rate * dt;
+            while em.spawn_accum >= 1.0 && em.particles.len() < em.max_particles {
+                em.spawn_accum -= 1.0;
+
+                let lifetime = em.lifetime_min + randf() * (em.lifetime_max - em.lifetime_min);
+                let start_size = em.start_size_min + randf() * (em.start_size_max - em.start_size_min);
+                let end_size = em.end_size_min + randf() * (em.end_size_max - em.end_size_min);
+
+                let mut vel = em.initial_velocity;
+                vel.x += (randf() * 2.0 - 1.0) * em.velocity_randomness;
+                vel.y += (randf() * 2.0 - 1.0) * em.velocity_randomness;
+                vel.z += (randf() * 2.0 - 1.0) * em.velocity_randomness;
+
+                let spawn_pos = match em.shape {
+                    EmitterShape::Point => pos,
+                    EmitterShape::Sphere { radius } => {
+                        pos + glam::Vec3::new(
+                            (randf() * 2.0 - 1.0) * radius,
+                            (randf() * 2.0 - 1.0) * radius,
+                            (randf() * 2.0 - 1.0) * radius,
+                        )
+                    }
+                    EmitterShape::Cone { angle_deg } => {
+                        let half = angle_deg.to_radians() * 0.5;
+                        let spread = randf() * half;
+                        let rot = glam::Quat::from_rotation_x(spread);
+                        pos + rot * vel.normalize_or_zero()
+                    }
+                };
+
+                let start_color = em.start_color;
+                let end_color   = em.end_color;
+                em.particles.push(Particle {
+                    position: spawn_pos,
+                    velocity: vel,
+                    age: 0.0,
+                    lifetime,
+                    start_size,
+                    end_size,
+                    start_color,
+                    end_color,
+                });
+            }
+
+            // Advance and kill particles.
+            let gravity = glam::Vec3::new(0.0, -9.81 * em.gravity_factor, 0.0);
+            em.particles.retain_mut(|p| {
+                p.age += dt;
+                p.velocity += gravity * dt;
+                p.position += p.velocity * dt;
+                p.age < p.lifetime
+            });
+        }
+    }
+
+    fn build_particle_vertices(&self) -> Vec<engine::vertex::ParticleVertex> {
+        use engine::vertex::ParticleVertex;
+
+        // Camera right/up for billboarding (extracted from view matrix rows).
+        let view = self.camera.view();
+        let cam_right = glam::Vec3::new(view.row(0).x, view.row(0).y, view.row(0).z);
+        let cam_up    = glam::Vec3::new(view.row(1).x, view.row(1).y, view.row(1).z);
+
+        let mut verts = Vec::new();
+
+        for (_, emitter) in self.world.query::<&ParticleEmitter>().iter() {
+            for p in &emitter.particles {
+                let t = (p.age / p.lifetime).clamp(0.0, 1.0);
+                let size = p.start_size + (p.end_size - p.start_size) * t;
+                let color = [
+                    p.start_color[0] + (p.end_color[0] - p.start_color[0]) * t,
+                    p.start_color[1] + (p.end_color[1] - p.start_color[1]) * t,
+                    p.start_color[2] + (p.end_color[2] - p.start_color[2]) * t,
+                    p.start_color[3] + (p.end_color[3] - p.start_color[3]) * t,
+                ];
+
+                let half = size * 0.5;
+                let bl = p.position - cam_right * half - cam_up * half;
+                let br = p.position + cam_right * half - cam_up * half;
+                let tl = p.position - cam_right * half + cam_up * half;
+                let tr = p.position + cam_right * half + cam_up * half;
+
+                // Two triangles: BL, BR, TR, BL, TR, TL
+                let make = |pos: glam::Vec3, uv: [f32; 2]| ParticleVertex {
+                    position: pos.to_array(),
+                    color,
+                    tex_coord: uv,
+                };
+                verts.push(make(bl, [0.0, 1.0]));
+                verts.push(make(br, [1.0, 1.0]));
+                verts.push(make(tr, [1.0, 0.0]));
+                verts.push(make(bl, [0.0, 1.0]));
+                verts.push(make(tr, [1.0, 0.0]));
+                verts.push(make(tl, [0.0, 0.0]));
+            }
+        }
+        verts
     }
 
     fn poll_gamepad(&mut self) {
@@ -2104,10 +2634,22 @@ impl ApplicationHandler for App {
                 self.update_game(dt);
 
 
+                // Fase 38: update parent-child world transforms.
+                self.update_world_transforms();
+                // Fase 41: advance property animators.
+                self.update_property_animators(dt);
+                // Fase 42: check trigger zones.
+                self.update_trigger_zones();
+                // Fase 40: advance particle simulation.
+                self.update_particles(dt);
+
                 let lighting_ubo = self.build_lighting_ubo(view_proj);
                 let (draw_list, total) = self.build_draw_list();
                 self.last_drawn = total; // GPU reports actual drawn count; CPU tracks submitted
                 self.last_total = total;
+
+                // Fase 40: build CPU billboard vertex list.
+                let particle_vertices = self.build_particle_vertices();
 
                 // Object picking (ray-AABB) — executed when user clicked in editor mode.
                 if self.pending_pick {
@@ -2361,6 +2903,7 @@ impl ApplicationHandler for App {
                         self.debug_settings.ssao_sample_count,
                         self.debug_settings.lod_distance_step,
                         sky_tint,
+                        &particle_vertices,
                     ) {
                         log::error!("Frame error: {e:#}");
                         event_loop.exit();

@@ -299,3 +299,84 @@ float storedDepth = texture(shadowMap, uv).r;
 float lit = (shadowRef <= storedDepth) ? 1.0 : 0.0;
 ```
 La semántica `LESS_OR_EQUAL` se preserva: `shadowRef <= storedDepth` → 1.0 (lit).
+---
+
+## Milestone 7: Partículas, Animación, ECS
+
+### Particle pipeline: formato HDR, NO swapchain
+El pipeline de partículas renderiza en el buffer HDR (`R16G16B16A16_SFLOAT`), no en el swapchain. Si se crea el pipeline con `swapchain_format` (`B8G8R8A8_SRGB`), Vulkan interpreta los canales al revés: R↔B intercambiados. Fuego naranja aparece azul.
+
+**Regla:** En `create_particle_pipeline()`, pasar `HDR_FORMAT` como `color_attachment_format`, no `swapchain_format`.
+
+### Partículas MSAA: TYPE_1 post-resolve
+Las partículas usan TYPE_1 (sin MSAA) aunque el main pass use MSAA 4x. El render de partículas ocurre después del resolve del main pass, directamente en el HDR buffer no-MSAA. Si se intenta usar el mismo sample count que el main pass, el pipeline no matchea el attachment.
+
+**Solución:** Pipeline de partículas siempre `VK_SAMPLE_COUNT_1_BIT`. Renderizar en hdr_color (1×) post-resolve, no en el MSAA color buffer.
+
+### Partículas: depth attachment condicional
+Cuando SSAO está activo, el depth buffer está en `SHADER_READ_ONLY_OPTIMAL` (lo usa SSAO como input). No se puede adjuntar como `DEPTH_STENCIL_ATTACHMENT` simultáneamente.
+
+```rust
+let has_depth_for_particles = self.msaa_depth.is_none() && !ssao_enabled;
+```
+
+Sin depth: las partículas no se recortan por geometría opaca. Con SSAO activo, aceptar esta limitación.
+
+### hecs: borrow conflicts con queries anidadas
+`self.world.query::<&Foo>()` toma `&self.world`. Si dentro del loop intentás `self.world.get::<&Bar>(e)`, tenés dos borrows de `self.world` simultáneos → no compila.
+
+**Patrón correcto:** Collect primero, procesar después.
+```rust
+// MAL
+for (e, foo) in self.world.query::<&Foo>().iter() {
+    let bar = self.world.get::<&Bar>(e); // E0502
+}
+
+// BIEN
+let entities: Vec<Entity> = self.world.query::<&Foo>().iter()
+    .map(|(e, _)| e).collect();
+for e in entities {
+    let mut foo = self.world.get::<&mut Foo>(e).unwrap();
+    // ... modificar
+}
+```
+
+### hecs: split borrow en campos del mismo struct
+Si un struct tiene `Vec<T>` y otros campos, Rust no permite mutar el Vec mientras se lee otro campo del mismo struct en el mismo expression.
+
+```rust
+// MAL — no compila
+emitter.particles.push(Particle {
+    start_color: emitter.start_color,  // borrow inmutable de emitter
+    // ^^ mientras emitter.particles está mutando
+});
+
+// BIEN — copiar antes del push
+let start_color = emitter.start_color;
+let end_color = emitter.end_color;
+emitter.particles.push(Particle { start_color, end_color, ... });
+```
+
+### PropertyAnimator: el collider no sigue la rotación automáticamente
+`update_property_animators` escribe en `Transform.rotation`, pero rapier no sabe nada de eso. El collider se queda en la posición/rotación original.
+
+**Solución:** Después de actualizar el transform, llamar `physics.set_body_pose(handle, pos, rot)` si la entidad tiene `PhysicsBody`. `set_body_pose` usa `rb.set_position(iso, true)` que funciona para cualquier tipo de cuerpo (static, dynamic, kinematic).
+
+### hecs: update_world_transforms con dos queries separadas
+La jerarquía necesita leer el transform de los hijos Y el transform de los padres. Si se hace en una sola query, intentar llamar `world.get::<&Transform>(parent_entity)` mientras se itera `query::<(&Transform, &Parent)>` genera borrow conflict.
+
+**Solución:**
+```rust
+// Paso 1: collect todos los transforms locales
+let local_mats: Vec<(Entity, Mat4)> = world.query::<&Transform>().iter()
+    .map(|(e, t)| (e, t.to_mat4())).collect();
+// Paso 2: collect el mapa de padres
+let parent_map: HashMap<Entity, Entity> = world.query::<&Parent>().iter()
+    .map(|(e, p)| (e, p.entity)).collect();
+// Paso 3: calcular world transforms usando solo los collected data
+```
+
+### save_session: serializar componentes M7
+`save_session()` serializa todas las entidades con `MeshRenderer`. Los campos `property_animator`, `trigger_zone` y `material_override` de `EntityDef` son `Option<*Def>` — hay que poblarlos explícitamente haciendo `world.get::<&PropertyAnimator>(entity)` etc. Si se dejan como `None`, esos componentes se pierden al recargar.
+
+También: al cargar una escena nombrada desde el menú, guardar el nombre en `current_scene_name` para que `save_session()` pueda actualizar ese archivo además de `.last_session.json`.

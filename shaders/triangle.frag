@@ -5,16 +5,17 @@ layout(location = 1) in vec2 fragTexCoord;
 layout(location = 2) in vec3 fragT;
 layout(location = 3) in vec3 fragB;
 layout(location = 4) in vec3 fragN;
+layout(location = 5) flat in uint instanceIndex; // Fase 44: from vertex shader
 
 layout(location = 0) out vec4 outColor;
 
 // Set 0: lighting UBO, shadow map, IBL maps
 layout(set = 0, binding = 0) uniform LightingUBO {
-    vec4 dirLightDir;      // xyz = toward-light direction (normalized), w unused
+    vec4 dirLightDir;      // xyz = toward-light direction (normalized), w = ibl_scale
     vec4 dirLightColor;    // xyz = color, w = intensity
     vec4 pointLightPos;    // xyz = world position, w unused
     vec4 pointLightColor;  // xyz = color, w = intensity
-    vec4 cameraPos;        // xyz = world position, w unused
+    vec4 cameraPos;        // xyz = world position, w = tone mode (0=Reinhard, 1=ACES)
     mat4 lightMvp;         // light view-projection (applied to world-space positions)
 } lights;
 
@@ -22,6 +23,24 @@ layout(set = 0, binding = 1) uniform sampler2D   shadowMap;
 layout(set = 0, binding = 2) uniform samplerCube irradianceMap;   // diffuse IBL
 layout(set = 0, binding = 3) uniform samplerCube prefilteredMap;  // specular IBL (mipped)
 layout(set = 0, binding = 4) uniform sampler2D   brdfLut;         // split-sum BRDF LUT
+
+// Fase 44: per-instance material override data (must match InstanceData in triangle.vert).
+struct InstanceData {
+    mat4 model;
+    vec4 world_min;
+    vec4 world_max;
+    uint mesh_index;
+    uint override_flags;  // bit 0=color, 1=metallic, 2=roughness, 3=emissive, 4=uv_scale
+    uint _pad1;
+    uint _pad2;
+    vec4 override_color;    // rgb = albedo override
+    vec4 override_mr;       // x=metallic, y=roughness
+    vec4 override_emissive; // xyz=emissive color, w=intensity
+};
+
+layout(set = 0, binding = 5) readonly buffer InstanceBuffer {
+    InstanceData instances[];
+};
 
 // Set 1: material textures
 layout(set = 1, binding = 0) uniform sampler2D albedoMap;           // R8G8B8A8_SRGB
@@ -78,13 +97,21 @@ vec3 cookTorrance(vec3 N, vec3 V, vec3 L, vec3 lightColor, float intensity,
 }
 
 void main() {
+    // Read per-instance override data (Fase 44)
+    uint flags = instances[instanceIndex].override_flags;
+
     // Albedo — GPU converts sRGB→linear automatically when format is R8G8B8A8_SRGB
     vec3 albedo = texture(albedoMap, fragTexCoord).rgb;
+    if ((flags & 1u) != 0u) {
+        albedo = instances[instanceIndex].override_color.rgb;
+    }
 
     // Metallic-roughness — glTF spec: G=roughness, B=metallic
     vec4  mrSample  = texture(metallicRoughnessMap, fragTexCoord);
     float roughness = max(mrSample.g, 0.04);  // clamp to avoid pure mirror
     float metallic  = mrSample.b;
+    if ((flags & 2u) != 0u) metallic  = instances[instanceIndex].override_mr.x;
+    if ((flags & 4u) != 0u) roughness = max(instances[instanceIndex].override_mr.y, 0.04);
 
     // Normal mapping: [0,1] → [-1,1], then transform to world space via TBN
     vec3 normalSample = texture(normalMap, fragTexCoord).rgb * 2.0 - 1.0;
@@ -115,16 +142,12 @@ void main() {
     vec3 color = (diffuse_ibl + specular_ibl) * ibl_scale;
 
     // Shadow: project world position into light clip space (orthographic).
-    // lightMvp is view-projection only; fragWorldPos is already in world space.
     vec4  shadowClip = lights.lightMvp * vec4(fragWorldPos, 1.0);
-    vec3  shadowNdc  = shadowClip.xyz / shadowClip.w; // xy in [-1,1], z in [0,1]
+    vec3  shadowNdc  = shadowClip.xyz / shadowClip.w;
     vec2  shadowUV   = shadowNdc.xy * 0.5 + 0.5;
-    float shadowRef  = shadowNdc.z - 0.002;           // small bias to reduce acne
+    float shadowRef  = shadowNdc.z - 0.002;
 
     // 3×3 PCF: average 9 samples with manual depth comparison (LESS_OR_EQUAL).
-    // MoltenVK does not support mutableComparisonSamplers, so we use sampler2D
-    // and compare manually: shadowRef <= storedDepth → 1.0 (lit), else 0.0 (shadow).
-    // Areas outside the shadow frustum (UV outside [0,1]) remain fully lit.
     float shadow = 1.0;
     if (shadowUV.x >= 0.0 && shadowUV.x <= 1.0 &&
         shadowUV.y >= 0.0 && shadowUV.y <= 1.0 &&
@@ -155,8 +178,13 @@ void main() {
                                         lights.pointLightColor.xyz, lights.pointLightColor.w,
                                         albedo, metallic, roughness);
 
+    // Fase 44: emissive contribution
+    if ((flags & 8u) != 0u) {
+        vec4 em = instances[instanceIndex].override_emissive;
+        color += em.xyz * em.w;
+    }
+
     // Tone mapping: Reinhard (mode 0) or ACES Filmic (mode 1).
-    // Mode is passed via cameraPos.w (unused in lighting; set per-frame by the app).
     if (lights.cameraPos.w >= 0.5) {
         // ACES Filmic (Hill approximation)
         const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;

@@ -30,6 +30,30 @@ pub struct DrawInstance {
     pub material_set_index: usize,
     pub world_min: glam::Vec3,
     pub world_max: glam::Vec3,
+    /// Fase 44: optional material parameter overrides.
+    pub override_flags:    u32,
+    pub override_color:    [f32; 4],
+    pub override_mr:       [f32; 4],
+    pub override_emissive: [f32; 4],
+}
+
+impl DrawInstance {
+    /// Create a basic draw instance without material overrides.
+    pub fn basic(
+        model: glam::Mat4,
+        mesh_index: usize,
+        material_set_index: usize,
+        world_min: glam::Vec3,
+        world_max: glam::Vec3,
+    ) -> Self {
+        Self {
+            model, mesh_index, material_set_index, world_min, world_max,
+            override_flags: 0,
+            override_color: [1.0, 1.0, 1.0, 1.0],
+            override_mr: [0.0, 0.5, 0.0, 0.0],
+            override_emissive: [0.0, 0.0, 0.0, 0.0],
+        }
+    }
 }
 
 /// A contiguous group of instances sharing the same material descriptor set.
@@ -229,6 +253,13 @@ pub struct VulkanContext {
     cull_pipeline_layout: vk::PipelineLayout,
     /// Compute pipeline that performs GPU frustum culling and writes indirect draw commands.
     cull_pipeline: vk::Pipeline,
+    // Particle system (Fase 40)
+    /// Pipeline layout for particle pass: push constant view_proj (64 bytes).
+    particle_pipeline_layout: vk::PipelineLayout,
+    /// Particle billboard graphics pipeline (additive blend, depth test, no depth write).
+    particle_pipeline: vk::Pipeline,
+    /// Per-frame-in-flight CPU-written vertex buffers for particle quads.
+    particle_vertex_buffers: Vec<BufferHandle>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1945,6 +1976,31 @@ impl VulkanContext {
         }
         log::info!("Cull compute pipeline + descriptor sets created");
 
+        // --- Particle billboard pipeline (Fase 40) ---
+        use super::vertex::ParticleVertex;
+        let pv_binding   = [ParticleVertex::binding_description()];
+        let pv_attributes = ParticleVertex::attribute_descriptions();
+        let (particle_pipeline_layout, particle_pipeline) =
+            super::pipeline::create_particle_pipeline(
+                &device,
+                HDR_FORMAT,   // particles render into hdr_color, not the swapchain
+                depth_format,
+                &pv_binding,
+                &pv_attributes,
+            )?;
+
+        // Per-frame particle vertex buffers (CpuToGpu, 256 KiB ≈ 7281 ParticleVertex @ 36 bytes).
+        const PARTICLE_BUFFER_SIZE: u64 = 256 * 1024;
+        let mut particle_vertex_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
+        for _ in 0..MAX_FRAMES_IN_FLIGHT {
+            let buf = resource_manager.create_buffer(
+                PARTICLE_BUFFER_SIZE,
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+                MemoryLocation::CpuToGpu,
+            )?;
+            particle_vertex_buffers.push(buf);
+        }
+
         Ok(Self {
             entry,
             instance,
@@ -2056,6 +2112,9 @@ impl VulkanContext {
             cull_descriptor_sets,
             cull_pipeline_layout,
             cull_pipeline,
+            particle_pipeline_layout,
+            particle_pipeline,
+            particle_vertex_buffers,
         })
     }
 
@@ -2085,6 +2144,7 @@ impl VulkanContext {
         ssao_sample_count: u32,
         lod_distance_step: f32,
         sky_tint: [f32; 4],
+        particle_vertices: &[super::vertex::ParticleVertex],
     ) -> Result<()> {
         let size = window.inner_size();
         if size.width == 0 || size.height == 0 {
@@ -2164,11 +2224,16 @@ impl VulkanContext {
             let instance_gpu_data: Vec<InstanceData> = instances[..clamped_count]
                 .iter()
                 .map(|inst| InstanceData {
-                    model:      inst.model.to_cols_array_2d(),
-                    world_min:  [inst.world_min.x, inst.world_min.y, inst.world_min.z, 0.0],
-                    world_max:  [inst.world_max.x, inst.world_max.y, inst.world_max.z, 0.0],
-                    mesh_index: inst.mesh_index as u32,
-                    _pad:       [0; 3],
+                    model:            inst.model.to_cols_array_2d(),
+                    world_min:        [inst.world_min.x, inst.world_min.y, inst.world_min.z, 0.0],
+                    world_max:        [inst.world_max.x, inst.world_max.y, inst.world_max.z, 0.0],
+                    mesh_index:       inst.mesh_index as u32,
+                    override_flags:   inst.override_flags,
+                    _pad1:            0,
+                    _pad2:            0,
+                    override_color:   inst.override_color,
+                    override_mr:      inst.override_mr,
+                    override_emissive: inst.override_emissive,
                 })
                 .collect();
             if !instance_gpu_data.is_empty() {
@@ -2214,6 +2279,17 @@ impl VulkanContext {
             rm_ref.write_buffer(self.gizmo_vertex_buffers[self.current_frame], capped);
         }
 
+        // Upload particle vertices (Fase 40). Cap at buffer capacity.
+        const PARTICLE_BUF_BYTES: usize = 256 * 1024;
+        let particle_vertex_count = if !particle_vertices.is_empty() {
+            let bytes = bytemuck::cast_slice::<super::vertex::ParticleVertex, u8>(particle_vertices);
+            let capped = &bytes[..bytes.len().min(PARTICLE_BUF_BYTES)];
+            rm_ref.write_buffer(self.particle_vertex_buffers[self.current_frame], capped);
+            (capped.len() / std::mem::size_of::<super::vertex::ParticleVertex>()) as u32
+        } else {
+            0
+        };
+
         // Extract light_view_proj from the UBO (already computed by the caller).
         let light_view_proj = glam::Mat4::from_cols_array(&lighting_ubo.light_mvp);
 
@@ -2253,6 +2329,7 @@ impl VulkanContext {
             ssao_active, ssao_strength,
             lod_distance_step,
             sky_tint,
+            particle_vertex_count,
         )?;
 
         // Update depth_initial_layout for next frame based on whether SSAO ran.
@@ -2338,6 +2415,7 @@ impl VulkanContext {
         ssao_strength: f32,
         lod_distance_step: f32,
         sky_tint: [f32; 4],
+        particle_vertex_count: u32,
     ) -> Result<()> {
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -2489,6 +2567,15 @@ impl VulkanContext {
                     &[cull_barrier],
                 );
             }
+        }
+
+        // --- Particle pass (Fase 40, conditional) ---
+        // hdr_color was left SHADER_READ_ONLY by Main+Skybox; bloom_overwrite transitions it
+        // COLOR_ATTACHMENT → SHADER_READ_ONLY again so bloom/composite can sample it.
+        // Depth is used read-only inside the pass but stays in DEPTH_STENCIL layout
+        // (no transition needed), so depth is not declared here.
+        if particle_vertex_count > 0 {
+            graph.add_pass("Particles", &[(r_hdr, ResourceAccess::bloom_overwrite())]);
         }
 
         // --- SSAO passes (conditional, non-MSAA only) ---
@@ -2865,6 +2952,74 @@ impl VulkanContext {
 
         self.profiler.end_pass(&self.device, cmd, frame_idx);
         graph.end_pass(&self.device, cmd);
+
+        // -----------------------------------------------------------------------
+        // Particle pass (Fase 40) — additive, renders into hdr_color after main pass.
+        // Uses hdr_color (LOAD/STORE) and depth buffer when no MSAA.
+        // -----------------------------------------------------------------------
+        if particle_vertex_count > 0 {
+            graph.begin_pass(&self.device, cmd);
+            self.profiler.begin_pass(&self.device, cmd, frame_idx, "Particles");
+
+            let particle_color_att = vk::RenderingAttachmentInfo::default()
+                .image_view(rm.get_image_view(self.hdr_color))
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::LOAD)
+                .store_op(vk::AttachmentStoreOp::STORE);
+
+            // Only attach depth when no MSAA and no SSAO.
+            // When SSAO is active, depth is SHADER_READ_ONLY (can't be used as attachment).
+            let particle_depth_att = vk::RenderingAttachmentInfo::default()
+                .image_view(rm.get_image_view(self.depth_image))
+                .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::LOAD)
+                .store_op(vk::AttachmentStoreOp::DONT_CARE);
+
+            let has_depth_for_particles = self.msaa_depth.is_none() && !ssao_enabled;
+            let p_rendering_info_base = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: self.swapchain_extent })
+                .layer_count(1)
+                .color_attachments(std::slice::from_ref(&particle_color_att));
+
+            let p_vbuf = rm.get_buffer(self.particle_vertex_buffers[self.current_frame]);
+            let view_proj_bytes: [f32; 16] = view_proj.to_cols_array();
+
+            // SAFETY: cmd is recording; all referenced handles are valid.
+            unsafe {
+                if has_depth_for_particles {
+                    let ri = p_rendering_info_base.depth_attachment(&particle_depth_att);
+                    self.dynamic_rendering_loader.cmd_begin_rendering(cmd, &ri);
+                } else {
+                    self.dynamic_rendering_loader.cmd_begin_rendering(cmd, &p_rendering_info_base);
+                }
+
+                let viewports = [vk::Viewport {
+                    x: 0.0,
+                    y: self.swapchain_extent.height as f32,
+                    width: self.swapchain_extent.width as f32,
+                    height: -(self.swapchain_extent.height as f32),
+                    min_depth: 0.0, max_depth: 1.0,
+                }];
+                self.device.cmd_set_viewport(cmd, 0, &viewports);
+                let scissors = [vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: self.swapchain_extent }];
+                self.device.cmd_set_scissor(cmd, 0, &scissors);
+
+                self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.particle_pipeline);
+                self.device.cmd_bind_vertex_buffers(cmd, 0, &[p_vbuf], &[0]);
+                // SAFETY: [f32;16] is Pod, 64 bytes; layout has 64-byte VERTEX push constant.
+                self.device.cmd_push_constants(
+                    cmd, self.particle_pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX, 0,
+                    bytemuck::cast_slice(&view_proj_bytes),
+                );
+                self.device.cmd_draw(cmd, particle_vertex_count, 1, 0, 0);
+
+                self.dynamic_rendering_loader.cmd_end_rendering(cmd);
+            }
+
+            self.profiler.end_pass(&self.device, cmd, frame_idx);
+            graph.end_pass(&self.device, cmd);
+        }
 
         // -----------------------------------------------------------------------
         // SSAO passes (conditional, non-MSAA only)
@@ -4005,6 +4160,9 @@ impl VulkanContext {
                 for &buf in &self.gizmo_vertex_buffers {
                     rm.destroy_buffer(buf);
                 }
+                for &buf in &self.particle_vertex_buffers {
+                    rm.destroy_buffer(buf);
+                }
                 for &buf in &self.ubo_buffers {
                     rm.destroy_buffer(buf);
                 }
@@ -4108,6 +4266,10 @@ impl VulkanContext {
             self.device.destroy_pipeline_layout(self.cull_pipeline_layout, None);
             self.device.destroy_descriptor_pool(self.cull_descriptor_pool, None);
             self.device.destroy_descriptor_set_layout(self.cull_set_layout, None);
+
+            // Particle pipeline (Fase 40).
+            self.device.destroy_pipeline(self.particle_pipeline, None);
+            self.device.destroy_pipeline_layout(self.particle_pipeline_layout, None);
 
             // Swapchain
             self.swapchain_loader

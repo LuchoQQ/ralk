@@ -18,6 +18,8 @@ pub(super) const COMPOSITE_FRAG_SPV:   &[u8] = include_bytes!("../../shaders/com
 pub(super) const SSAO_FRAG_SPV:        &[u8] = include_bytes!("../../shaders/ssao.frag.spv");
 pub(super) const SSAO_BLUR_FRAG_SPV:   &[u8] = include_bytes!("../../shaders/ssao_blur.frag.spv");
 pub(super) const CULL_COMP_SPV:        &[u8] = include_bytes!("../../shaders/cull.comp.spv");
+pub(super) const PARTICLE_VERT_SPV:    &[u8] = include_bytes!("../../shaders/particle.vert.spv");
+pub(super) const PARTICLE_FRAG_SPV:    &[u8] = include_bytes!("../../shaders/particle.frag.spv");
 
 fn create_shader_module(device: &ash::Device, spv: &[u8]) -> Result<vk::ShaderModule> {
     assert!(spv.len() % 4 == 0, "SPIR-V binary size must be a multiple of 4");
@@ -1250,4 +1252,134 @@ pub fn create_skybox_pipeline(
 
     log::info!("Skybox pipeline created (fullscreen triangle, depth LESS_OR_EQUAL, no depth write)");
     Ok((pipeline_layout, pipeline))
+}
+
+/// Particle billboard pipeline (Fase 40).
+///
+/// Push constants (vertex stage): 64 bytes — `view_proj` (mat4).
+/// No descriptor sets — vertices carry all per-particle data.
+/// Additive blending: src=ONE, dst=ONE for fire/glow particles.
+/// Depth test ON, depth write OFF — particles sort behind opaque but not each other.
+///
+/// Returns `(PipelineLayout, Pipeline)`. Caller owns and must destroy both.
+pub fn create_particle_pipeline(
+    device: &ash::Device,
+    swapchain_format: vk::Format,
+    depth_format: vk::Format,
+    binding_descriptions: &[vk::VertexInputBindingDescription],
+    attribute_descriptions: &[vk::VertexInputAttributeDescription],
+) -> Result<(vk::PipelineLayout, vk::Pipeline)> {
+    // Push constant: view_proj mat4, 64 bytes, vertex stage.
+    let push_constant_range = vk::PushConstantRange::default()
+        .stage_flags(vk::ShaderStageFlags::VERTEX)
+        .offset(0)
+        .size(64);
+    let push_constant_ranges = [push_constant_range];
+
+    let layout_info = vk::PipelineLayoutCreateInfo::default()
+        .push_constant_ranges(&push_constant_ranges);
+    // SAFETY: device is valid.
+    let pipeline_layout = unsafe { device.create_pipeline_layout(&layout_info, None) }
+        .context("Failed to create particle pipeline layout")?;
+
+    let vert_module = create_shader_module(device, PARTICLE_VERT_SPV)?;
+    let frag_module = create_shader_module(device, PARTICLE_FRAG_SPV)?;
+
+    let entry_point = c"main";
+    let shader_stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vert_module)
+            .name(entry_point),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(frag_module)
+            .name(entry_point),
+    ];
+
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+        .vertex_binding_descriptions(binding_descriptions)
+        .vertex_attribute_descriptions(attribute_descriptions);
+
+    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+        .primitive_restart_enable(false);
+
+    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+        .viewport_count(1)
+        .scissor_count(1);
+
+    let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+        .depth_clamp_enable(false)
+        .rasterizer_discard_enable(false)
+        .polygon_mode(vk::PolygonMode::FILL)
+        .line_width(1.0)
+        .cull_mode(vk::CullModeFlags::NONE)
+        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+        .depth_bias_enable(false);
+
+    let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+        .sample_shading_enable(false)
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+
+    // Additive blending: outColor = src * 1 + dst * 1
+    let color_blend_attachment = vk::PipelineColorBlendAttachmentState::default()
+        .color_write_mask(vk::ColorComponentFlags::RGBA)
+        .blend_enable(true)
+        .src_color_blend_factor(vk::BlendFactor::ONE)
+        .dst_color_blend_factor(vk::BlendFactor::ONE)
+        .color_blend_op(vk::BlendOp::ADD)
+        .src_alpha_blend_factor(vk::BlendFactor::ONE)
+        .dst_alpha_blend_factor(vk::BlendFactor::ONE)
+        .alpha_blend_op(vk::BlendOp::ADD);
+    let color_blend_attachments = [color_blend_attachment];
+    let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
+        .logic_op_enable(false)
+        .attachments(&color_blend_attachments);
+
+    // Depth test ON (particles occluded by geometry), depth write OFF (particles don't block each other).
+    let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+        .depth_test_enable(true)
+        .depth_write_enable(false)
+        .depth_compare_op(vk::CompareOp::LESS)
+        .depth_bounds_test_enable(false)
+        .stencil_test_enable(false);
+
+    let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dynamic_state =
+        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+
+    let color_formats = [swapchain_format];
+    let mut rendering_info = vk::PipelineRenderingCreateInfo::default()
+        .color_attachment_formats(&color_formats)
+        .depth_attachment_format(depth_format);
+
+    let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&shader_stages)
+        .vertex_input_state(&vertex_input)
+        .input_assembly_state(&input_assembly)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&rasterization)
+        .multisample_state(&multisample)
+        .color_blend_state(&color_blend)
+        .depth_stencil_state(&depth_stencil)
+        .dynamic_state(&dynamic_state)
+        .layout(pipeline_layout)
+        .push_next(&mut rendering_info);
+
+    // SAFETY: device is valid, all referenced state lives on the stack.
+    let pipelines = unsafe {
+        device.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+    }
+    .map_err(|(_p, e)| e)
+    .context("Failed to create particle pipeline")?;
+
+    // SAFETY: shader modules baked into pipeline — safe to destroy.
+    unsafe {
+        device.destroy_shader_module(vert_module, None);
+        device.destroy_shader_module(frag_module, None);
+    }
+
+    log::info!("Particle pipeline created (additive blend, depth test ON, depth write OFF)");
+    Ok((pipeline_layout, pipelines[0]))
 }
