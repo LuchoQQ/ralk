@@ -110,7 +110,9 @@ void main() {
     vec2  brdf            = texture(brdfLut, vec2(NdotV, roughness)).rg;
     vec3  specular_ibl    = prefColor * (F_amb * brdf.x + brdf.y);
 
-    vec3 color = diffuse_ibl + specular_ibl;
+    // ibl_scale is packed into dirLightDir.w (0 = no IBL, 1 = full IBL).
+    float ibl_scale = lights.dirLightDir.w;
+    vec3 color = (diffuse_ibl + specular_ibl) * ibl_scale;
 
     // Shadow: project world position into light clip space (orthographic).
     // lightMvp is view-projection only; fragWorldPos is already in world space.

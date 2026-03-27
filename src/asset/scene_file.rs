@@ -5,13 +5,67 @@ use serde::{Deserialize, Serialize};
 // scene.json format
 // ---------------------------------------------------------------------------
 
-/// Top-level scene file. Saved/loaded from `scene.json` in the working directory.
+/// Scene configuration: which assets to use.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SceneConfig {
+    #[serde(default)]
+    pub skybox: String,
+    #[serde(default)]
+    pub terrain: String,
+    #[serde(default)]
+    pub character: String,
+    #[serde(default)]
+    pub props_catalog: String,
+}
+
+/// Player state saved/restored between sessions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlayerState {
+    pub position: [f32; 3],
+    pub camera_yaw: f32,
+    pub camera_pitch: f32,
+}
+
+impl Default for PlayerState {
+    fn default() -> Self {
+        Self { position: [0.0, 0.9, 5.0], camera_yaw: 0.0, camera_pitch: 0.0 }
+    }
+}
+
+/// A placed prop instance in the scene.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlacedProp {
+    pub prop_id: String,
+    /// Model path (resolved from catalog at load time).
+    #[serde(default)]
+    pub model: String,
+    pub position: [f32; 3],
+    pub rotation: [f32; 4],
+    pub scale: [f32; 3],
+}
+
+/// Top-level scene file. Saved/loaded from `scenes/{name}.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SceneFile {
+    /// Scene configuration (skybox, terrain, character, props catalog).
+    #[serde(default)]
+    pub config: SceneConfig,
+    /// Player state (position, camera orientation).
+    #[serde(default)]
+    pub player: PlayerState,
+    /// Time of day (0..1).
+    #[serde(default)]
+    pub time_of_day: f32,
+    /// Day/night cycle speed multiplier.
+    #[serde(default = "default_day_night_speed")]
+    pub day_night_speed: f32,
     /// Paths to glTF/glb model files to load (relative to cwd).
     pub models: Vec<String>,
     /// Renderable entities: each references global mesh/material indices.
     pub entities: Vec<EntityDef>,
+    /// Placed props (from catalog, by prop_id).
+    #[serde(default)]
+    pub placed_props: Vec<PlacedProp>,
     /// Single directional (sun) light.
     pub directional_light: DirLightDef,
     /// Point lights.
@@ -21,6 +75,8 @@ pub struct SceneFile {
     #[serde(default)]
     pub scripts: Vec<String>,
 }
+
+fn default_day_night_speed() -> f32 { 1.0 }
 
 /// AudioSource parameters stored in scene.json.
 #[derive(Debug, Clone, Serialize, Deserialize)]

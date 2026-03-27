@@ -1,4 +1,4 @@
-# vibe-engine
+# ralk
 
 Motor 3D Rust + Vulkan, nativo Linux + macOS (MoltenVK).
 
@@ -13,11 +13,6 @@ WINIT_UNIX_BACKEND=x11 cargo run       # forzar X11 (RenderDoc en Linux)
 ## Docs (leer cuando sea relevante, no antes)
 
 - `docs/architecture.md` → estado actual del código, tipos, render loop
-- `docs/milestone-1.md` → M1 completado (Vulkan → PBR → sombras)
-- `docs/milestone-2.md` → M2 completado (ECS → skybox → egui → MSAA)
-- `docs/milestone-3.md` → M3 completado (physics → audio → render graph → bloom → gizmos)
-- `docs/milestone-4.md` → M4 activo (SSAO, profiling, GPU-driven, LOD, async assets, scripting)
-- `docs/prompts-m4.md` → prompts por fase del M4
 - `docs/gotchas.md` → errores que se repiten
 
 ## Reglas del stack (no cambiar sin justificación)
@@ -37,13 +32,20 @@ WINIT_UNIX_BACKEND=x11 cargo run       # forzar X11 (RenderDoc en Linux)
 - Nunca `.unwrap()` en render loop
 - Passes nuevos se agregan al render graph, no al command buffer directo
 
-## Milestone actual: M4 "Production ready"
+## Estado actual
 
-Fases 21-26. Ver `docs/milestone-4.md` para checkboxes y `docs/prompts-m4.md` para prompts.
+Motor funcional con sandbox de exploración en primera persona.
 
-## Decisiones pendientes
+**Decisiones tomadas:**
+- SSAO normals: reconstrucción desde depth (no MRT)
+- GPU-driven: agrupado por material (no bindless)
+- LOD transition: hard switch
+- Scripting: mlua (Lua 5.4)
 
-- [ ] ¿SSAO normals: MRT o reconstrucción desde depth? → decidir en fase 21
-- [ ] ¿GPU-driven: bindless textures o agrupar por material? → decidir en fase 23
-- [ ] ¿LOD transition: dithered crossfade o hard switch? → decidir en fase 24
-- [ ] ¿Scripting: mlua (Lua 5.4) o rhai (Rust-native)? → decidir en fase 26
+**Player:** capsule body dinámico en rapier (rotación bloqueada). Input → velocidad XZ, gravedad en Y la maneja rapier. Cámara sigue posición del capsule + eye offset.
+
+**UI:** pantalla limpia durante exploración. Escape → sidebar izquierdo con todas las secciones de debug (colapsables).
+
+**Sandbox:** `spawn_sandbox_scene()` — piso 40×40, paredes, pilares, obstáculos estáticos, cubos dinámicos, instancias de modelos GLB con física.
+
+**Builtin cube:** siempre appendado al final de `load_multi_glb`. `cube_mesh_index = meshes.len() - 1` siempre válido.

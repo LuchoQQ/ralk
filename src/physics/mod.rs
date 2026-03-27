@@ -62,6 +62,8 @@ pub struct PhysicsWorld {
     impulse_joints: ImpulseJointSet,
     multibody_joints: MultibodyJointSet,
     ccd_solver: CCDSolver,
+    /// Used for ray-cast ground detection (player jump).
+    query_pipeline: QueryPipeline,
 }
 
 impl PhysicsWorld {
@@ -78,6 +80,7 @@ impl PhysicsWorld {
             impulse_joints: ImpulseJointSet::new(),
             multibody_joints: MultibodyJointSet::new(),
             ccd_solver: CCDSolver::new(),
+            query_pipeline: QueryPipeline::new(),
         }
     }
 
@@ -99,6 +102,7 @@ impl PhysicsWorld {
             &(),
             &(),
         );
+        self.query_pipeline.update(&self.colliders);
     }
 
     /// Like `step`, but also collects world-space positions of new collision contacts.
@@ -122,6 +126,7 @@ impl PhysicsWorld {
             &(),
             &collector,
         );
+        self.query_pipeline.update(&self.colliders);
         collector.positions.into_inner().unwrap_or_default()
     }
 
@@ -221,5 +226,42 @@ impl PhysicsWorld {
         let pos = Vec3::new(t.x, t.y, t.z);
         let rot = Quat::from_xyzw(r.i, r.j, r.k, r.w);
         Some((pos, rot))
+    }
+
+    /// Ray-cast downward from the player capsule center to detect ground contact.
+    ///
+    /// `half_height + radius + margin` = 0.5 + 0.4 + 0.15 = 1.05 — if the ray
+    /// hits anything within that distance, the capsule is considered grounded.
+    pub fn is_grounded(&self, handle: RigidBodyHandle) -> bool {
+        let rb = match self.rigid_bodies.get(handle) {
+            Some(rb) => rb,
+            None => return false,
+        };
+        let pos = rb.translation();
+        let ray = Ray::new(
+            Point::new(pos.x, pos.y, pos.z),
+            Vector::new(0.0, -1.0, 0.0),
+        );
+        let filter = QueryFilter::default().exclude_rigid_body(handle);
+        self.query_pipeline.cast_ray(
+            &self.rigid_bodies,
+            &self.colliders,
+            &ray,
+            1.05,   // half_height(0.5) + radius(0.4) + margin(0.15)
+            true,
+            filter,
+        ).is_some()
+    }
+
+    /// Apply an upward impulse to a body (used for jumping).
+    pub fn apply_jump_impulse(&mut self, handle: RigidBodyHandle, impulse_y: f32) {
+        if let Some(rb) = self.rigid_bodies.get_mut(handle) {
+            rb.apply_impulse(vector![0.0, impulse_y, 0.0], true);
+        }
+    }
+
+    /// Read the current Y velocity of a body.
+    pub fn get_y_velocity(&self, handle: RigidBodyHandle) -> f32 {
+        self.rigid_bodies.get(handle).map(|rb| rb.linvel().y).unwrap_or(0.0)
     }
 }

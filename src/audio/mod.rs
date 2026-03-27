@@ -347,4 +347,53 @@ pub fn ensure_sample_sounds() {
             .unwrap_or_else(|e| log::warn!("Could not create wind_loop.wav: {e}"));
         log::info!("Created assets/sounds/wind_loop.wav");
     }
+
+    // Jump: short upward pitch sweep
+    if !Path::new("assets/sounds/jump.wav").exists() {
+        let pi2 = std::f32::consts::TAU;
+        write_wav_flat("assets/sounds/jump.wav", |t| {
+            let freq = 220.0 + 440.0 * t; // rising pitch 220→660 Hz over 0.15s
+            let env = (-t * 12.0).exp();
+            f32::sin(pi2 * freq * t) * env * 0.5
+        }, 0.15)
+        .unwrap_or_else(|e| log::warn!("Could not create jump.wav: {e}"));
+        log::info!("Created assets/sounds/jump.wav");
+    }
+
+    // Land: low thud on landing
+    if !Path::new("assets/sounds/land.wav").exists() {
+        write_wav_sine("assets/sounds/land.wav", 80.0, 0.7, 0.2)
+            .unwrap_or_else(|e| log::warn!("Could not create land.wav: {e}"));
+        log::info!("Created assets/sounds/land.wav");
+    }
+
+    // Footstep: soft percussive click
+    if !Path::new("assets/sounds/footstep.wav").exists() {
+        write_wav_sine("assets/sounds/footstep.wav", 150.0, 0.4, 0.12)
+            .unwrap_or_else(|e| log::warn!("Could not create footstep.wav: {e}"));
+        log::info!("Created assets/sounds/footstep.wav");
+    }
+
+    // Placement: short click when placing a prop
+    if !Path::new("assets/sounds/placement.wav").exists() {
+        let pi2 = std::f32::consts::TAU;
+        write_wav_flat("assets/sounds/placement.wav", |t| {
+            let env = (-t * 20.0).exp();
+            (f32::sin(pi2 * 400.0 * t) * 0.5 + f32::sin(pi2 * 800.0 * t) * 0.25) * env
+        }, 0.1)
+        .unwrap_or_else(|e| log::warn!("Could not create placement.wav: {e}"));
+        log::info!("Created assets/sounds/placement.wav");
+    }
+
+    // Delete whoosh
+    if !Path::new("assets/sounds/delete.wav").exists() {
+        let pi2 = std::f32::consts::TAU;
+        write_wav_flat("assets/sounds/delete.wav", |t| {
+            let freq = 600.0 - 400.0 * t; // falling pitch
+            let env = (-t * 8.0).exp();
+            f32::sin(pi2 * freq * t) * env * 0.4
+        }, 0.25)
+        .unwrap_or_else(|e| log::warn!("Could not create delete.wav: {e}"));
+        log::info!("Created assets/sounds/delete.wav");
+    }
 }

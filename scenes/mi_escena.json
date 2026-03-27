@@ -1,0 +1,37 @@
+{
+  "config": {
+    "skybox": "",
+    "terrain": "",
+    "character": "",
+    "props_catalog": "assets/props/default_props.json"
+  },
+  "player": {
+    "position": [
+      0.0,
+      0.9,
+      5.0
+    ],
+    "camera_yaw": 0.0,
+    "camera_pitch": 0.0
+  },
+  "time_of_day": 0.0,
+  "day_night_speed": 1.0,
+  "models": [],
+  "entities": [],
+  "placed_props": [],
+  "directional_light": {
+    "direction": [
+      0.4,
+      -1.0,
+      -0.6
+    ],
+    "color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "intensity": 1.5
+  },
+  "point_lights": [],
+  "scripts": []
+}

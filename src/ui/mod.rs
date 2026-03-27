@@ -63,6 +63,12 @@ pub struct DebugSettings {
     // LOD settings (Fase 24)
     /// Distance step per LOD level. LOD = floor(dist / step). 0 = LOD disabled (always LOD 0).
     pub lod_distance_step: f32,
+    // Bloom settings
+    pub bloom_enabled: bool,
+    pub bloom_intensity: f32,
+    pub bloom_threshold: f32,
+    /// IBL (ambient) contribution scale. 0 = no IBL, 1 = full IBL.
+    pub ibl_scale: f32,
 }
 
 /// Audio settings controlled via the egui audio panel.
@@ -81,6 +87,8 @@ pub struct PhysicsUiState {
     pub spawn_cube_clicked: bool,
     /// Toggles rendering of collider wireframes.
     pub show_wireframe: bool,
+    /// Jump force (impulse magnitude, kg·m/s). Tunable in the Physics panel.
+    pub jump_force: f32,
 }
 
 /// State shared between the scene panel and the main loop.
@@ -131,6 +139,109 @@ pub struct ScriptingUiState {
     pub scripts: Vec<(String, bool, Option<String>)>,
     /// Recent log messages emitted by scripts (capped at 50).
     pub log_lines: Vec<String>,
+}
+
+/// Top-level application screen (Fase 34).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AppScreen {
+    /// Fullscreen main menu (no physics, no scene).
+    #[default]
+    MainMenu,
+    /// Scene configuration / creation screen.
+    Settings,
+    /// Active exploration sandbox.
+    InScene,
+}
+
+/// Actions emitted by the main menu panel.
+#[derive(Debug, Default)]
+pub struct MainMenuAction {
+    /// Load the last session.
+    pub continue_game: bool,
+    /// Go to settings to create a new scene.
+    pub new_scene: bool,
+    /// Load a named scene from `scenes/`.
+    pub load_scene: Option<String>,
+    /// Exit the application.
+    pub quit: bool,
+}
+
+/// State for the main menu panel.
+pub struct MainMenuUiState {
+    pub action: MainMenuAction,
+    /// Whether `.last_session.json` exists (enables "Continuar").
+    pub has_last_session: bool,
+    /// List of available saved scenes (names without extension).
+    pub saved_scenes: Vec<String>,
+}
+
+/// State for the settings / scene creation screen.
+pub struct SettingsUiState {
+    pub action_create: bool,
+    pub action_back: bool,
+    /// Scene name to create.
+    pub scene_name: String,
+    /// Available skybox paths (scanned from assets/skyboxes/).
+    pub skybox_options: Vec<String>,
+    pub selected_skybox: usize,
+    /// Available terrain paths (scanned from assets/terrains/).
+    pub terrain_options: Vec<String>,
+    pub selected_terrain: usize,
+    /// Available character paths (scanned from assets/characters/).
+    pub character_options: Vec<String>,
+    pub selected_character: usize,
+    /// Available props catalog paths (scanned from assets/props/).
+    pub catalog_options: Vec<String>,
+    pub selected_catalog: usize,
+    /// Graphics settings.
+    pub msaa: u32,
+    pub ssao: bool,
+    pub bloom: bool,
+}
+
+/// Prop placement mode state.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlacementState {
+    /// No prop selected for placement.
+    None,
+    /// A prop is selected, waiting for click to place.
+    Active {
+        prop_id: String,
+        /// Current preview rotation around Y axis (radians).
+        preview_rotation_y: f32,
+        /// Current preview scale.
+        preview_scale: f32,
+    },
+}
+
+impl Default for PlacementState {
+    fn default() -> Self { PlacementState::None }
+}
+
+/// State for the props catalog panel.
+pub struct PropsUiState {
+    /// Whether the props panel is open.
+    pub open: bool,
+    /// Current category filter (empty = all).
+    pub category_filter: String,
+    /// Search query.
+    pub search: String,
+    /// Currently selected prop for placement.
+    pub selected_prop: Option<String>,
+    /// Prop clicked (set by panel, consumed by main loop).
+    pub place_clicked: Option<String>,
+    /// Delete selected entity (set by panel).
+    pub delete_clicked: bool,
+    /// Duplicate selected entity.
+    pub duplicate_clicked: bool,
+    /// Undo last action.
+    pub undo_clicked: bool,
+    /// Grid snap toggle.
+    pub grid_snap: bool,
+    /// Grid size (0.5, 1.0, or 2.0).
+    pub grid_size: f32,
+    /// Catalog entries populated by the main loop each frame: (id, display_name, category).
+    pub catalog_entries: Vec<(String, String, String)>,
 }
 
 /// Game mode (exploration sandbox).
@@ -205,10 +316,14 @@ impl DebugUi {
         self.winit_state.on_window_event(window, event).consumed
     }
 
-    /// Build one frame of UI. Returns clipped primitives + texture delta.
+    /// Build one frame of UI. Dispatches to the appropriate panel based on `app_screen`.
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         &mut self,
         window: &Window,
+        app_screen: AppScreen,
+        main_menu: &mut MainMenuUiState,
+        settings_ui: &mut SettingsUiState,
         stats: &FrameStats,
         world: &mut hecs::World,
         settings: &mut DebugSettings,
@@ -220,13 +335,18 @@ impl DebugUi {
         day_night: &mut DayNightUiState,
         vehicle_audio: &mut VehicleAudioUiState,
         game_hud: &mut GameHudState,
+        props: &mut PropsUiState,
     ) -> (Vec<egui::ClippedPrimitive>, egui::TexturesDelta) {
         let raw_input = self.winit_state.take_egui_input(window);
         let output = self.ctx.run(raw_input, |ctx| {
-            panels::sidebar(
-                ctx, stats, world, settings, scene, physics, audio,
-                editor, scripting, day_night, vehicle_audio, game_hud,
-            );
+            match app_screen {
+                AppScreen::MainMenu => panels::main_menu(ctx, main_menu),
+                AppScreen::Settings => panels::settings_panel(ctx, settings_ui),
+                AppScreen::InScene => panels::sidebar(
+                    ctx, stats, world, settings, scene, physics, audio,
+                    editor, scripting, day_night, vehicle_audio, game_hud, props,
+                ),
+            }
         });
         self.winit_state.handle_platform_output(window, output.platform_output);
         let clipped = self.ctx.tessellate(output.shapes, output.pixels_per_point);

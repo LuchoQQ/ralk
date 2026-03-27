@@ -1,0 +1,130 @@
+{
+  "props": [
+    {
+      "id": "cube_dynamic",
+      "name": "Cubo dinámico",
+      "model": "",
+      "physics": "dynamic",
+      "collider": "box",
+      "category": "básico",
+      "scale": [1.0, 1.0, 1.0]
+    },
+    {
+      "id": "cube_static",
+      "name": "Cubo estático",
+      "model": "",
+      "physics": "static",
+      "collider": "box",
+      "category": "básico",
+      "scale": [1.0, 1.0, 1.0]
+    },
+    {
+      "id": "platform_small",
+      "name": "Plataforma pequeña",
+      "model": "",
+      "physics": "static",
+      "collider": "box",
+      "category": "plataformas",
+      "scale": [4.0, 0.3, 4.0]
+    },
+    {
+      "id": "platform_large",
+      "name": "Plataforma grande",
+      "model": "",
+      "physics": "static",
+      "collider": "box",
+      "category": "plataformas",
+      "scale": [8.0, 0.3, 8.0]
+    },
+    {
+      "id": "platform_narrow",
+      "name": "Plataforma estrecha",
+      "model": "",
+      "physics": "static",
+      "collider": "box",
+      "category": "plataformas",
+      "scale": [8.0, 0.3, 1.5]
+    },
+    {
+      "id": "step_block",
+      "name": "Escalón",
+      "model": "",
+      "physics": "static",
+      "collider": "box",
+      "category": "plataformas",
+      "scale": [2.0, 0.5, 2.0]
+    },
+    {
+      "id": "ramp",
+      "name": "Rampa",
+      "model": "",
+      "physics": "static",
+      "collider": "box",
+      "category": "plataformas",
+      "scale": [3.0, 0.2, 5.0]
+    },
+    {
+      "id": "pillar",
+      "name": "Pilar",
+      "model": "",
+      "physics": "static",
+      "collider": "box",
+      "category": "arquitectura",
+      "scale": [0.6, 4.0, 0.6]
+    },
+    {
+      "id": "wall_segment",
+      "name": "Segmento de muro",
+      "model": "",
+      "physics": "static",
+      "collider": "box",
+      "category": "arquitectura",
+      "scale": [4.0, 3.0, 0.3]
+    },
+    {
+      "id": "wall_low",
+      "name": "Muro bajo",
+      "model": "",
+      "physics": "static",
+      "collider": "box",
+      "category": "arquitectura",
+      "scale": [4.0, 1.2, 0.3]
+    },
+    {
+      "id": "crate",
+      "name": "Caja de madera",
+      "model": "",
+      "physics": "dynamic",
+      "collider": "box",
+      "category": "objetos",
+      "scale": [1.0, 1.0, 1.0]
+    },
+    {
+      "id": "barrel",
+      "name": "Barril",
+      "model": "",
+      "physics": "dynamic",
+      "collider": "box",
+      "category": "objetos",
+      "scale": [0.7, 1.2, 0.7]
+    },
+    {
+      "id": "crate_large",
+      "name": "Cajón grande",
+      "model": "",
+      "physics": "dynamic",
+      "collider": "box",
+      "category": "objetos",
+      "scale": [1.5, 1.5, 1.5]
+    },
+    {
+      "id": "obstacle",
+      "name": "Obstáculo",
+      "model": "",
+      "physics": "static",
+      "collider": "box",
+      "category": "objetos",
+      "scale": [1.5, 1.0, 1.5]
+    }
+  ]
+}

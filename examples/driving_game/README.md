@@ -1,19 +1,34 @@
-# Driving Game — ralk example
+# Sandbox — ralk example
 
-A minimal lap-racing game built on top of **vibe-engine** (ralk).
-Demonstrates every major engine feature in one playable experience.
+A configurable sandbox built on top of **ralk**, a Vulkan-first 3D engine in Rust.
+Demonstrates main menu, scene management, player jump, prop placement, and day/night cycle.
 
 ## Run
 
 ```bash
 # From the repository root:
-cargo run --example driving_game         # debug (validation layers on)
-cargo run --example driving_game --release   # release (~3-5× faster)
+cargo run                                  # debug (validation layers on)
+cargo run --release                        # release (~3–5× faster)
+cargo run --example driving_game           # same binary via example entry point
+cargo run --example driving_game --release
 ```
 
 > **macOS / MoltenVK**: works out of the box.
-> **Linux**: requires a Vulkan 1.2+ driver (Mesa 22+, NVIDIA proprietary ≥ 515).
+> **Linux**: requires a Vulkan 1.2+ driver (Mesa 22+, NVIDIA ≥ 515).
 > No assets to download — placeholder sounds are generated on first run.
+
+---
+
+## First run flow
+
+1. Launch → **main menu** appears.
+2. Click **Nueva escena** → settings screen → enter a name → **Crear escena**.
+3. Scene loads with a flat 40 × 40 m ground.  Mouse auto-captured → start exploring.
+4. **Esc** → pause sidebar with debug panels.
+5. Exit → session auto-saved to `scenes/.last_session.json`.
+6. Re-launch → **Continuar** restores exact position, time of day, and all placed props.
+
+Alternatively, load `scenes/sandbox.json` from **Cargar escena** for a pre-built layout.
 
 ---
 
@@ -21,78 +36,93 @@ cargo run --example driving_game --release   # release (~3-5× faster)
 
 | Input | Action |
 |-------|--------|
-| **W** | Throttle |
-| **S** | Brake |
-| **A / D** | Steer left / right *(camera yaw when mouse captured)* |
-| **Space** | Handbrake — guaranteed tyre squeal at speed |
-| **Shift** | Sprint (free-camera fast-move) |
-| **Esc** | Pause / release mouse |
-| **Left-click** | Click entity in editor mode (mouse released) |
+| **W / S** | Move forward / backward |
+| **A / D** | Strafe left / right |
+| **Space** | Jump |
+| **Shift** | Sprint |
+| **Esc** | Pause (sidebar) / cancel placement |
+| **G** | Toggle grid snap (editor mode) |
 | **W / E / R** | Gizmo: Translate / Rotate / Scale *(mouse released)* |
+| **Left-click** | Pick entity *(mouse released)* / place prop *(placement mode)* |
 
 ### Gamepad (XInput / DS4)
 
 | Input | Action |
 |-------|--------|
-| Left stick Y | Forward / brake |
-| Left stick X | Steer |
+| Left stick | Move |
 | Right stick | Camera look |
+| South button (A/Cross) | Jump |
 
 ---
 
-## Gameplay
+## Props placement
 
-1. Launch → **main menu** appears centred on screen.
-2. Click **PLAY** → 4-second countdown (3 – 2 – 1 – GO!).
-3. Drive through the 4 **checkpoints** in order (0 → 1 → 2 → 3/finish).
-4. Cross the finish line after all checkpoints → **LAP COMPLETE** screen with your time.
-5. Best time is saved to `best_lap.json` in the working directory and loaded on the next run.
-6. Press **Esc** during a race to **pause** → RESUME / RESTART / MAIN MENU.
+1. **Esc** → pause sidebar.
+2. Open **Props (Tab)** section.
+3. Select a prop from the catalog (loaded from `assets/props/default_props.json`).
+4. Close sidebar → click on the ground to place.
+5. Select placed prop → move with **W/E/R** gizmos.
+6. **Delete** (sidebar button) to remove selected entity.
+7. **Ctrl+Z** (sidebar button) to undo last placement.
+8. Save via **Scene → Save** in the sidebar.
+
+---
+
+## Adding custom props
+
+1. Create or download a glTF model (`.glb`).
+2. Place it in `assets/` or any reachable path.
+3. Add an entry to `assets/props/default_props.json`:
+
+```json
+{
+  "id": "my_crate",
+  "name": "My Crate",
+  "model": "assets/my_crate.glb",
+  "thumbnail": "",
+  "physics": "dynamic",
+  "collider": "box",
+  "category": "objetos"
+}
+```
+
+4. Load or create a scene that references `assets/props/default_props.json` as the catalog.
+5. The prop appears in the Props panel immediately.
+
+---
+
+## Adding custom skyboxes
+
+Drop a `.hdr` equirectangular panorama into `assets/skyboxes/`.
+It will appear in the **Nueva escena** settings dropdown on next launch.
 
 ---
 
 ## Engine features demonstrated
 
-| Feature | Where |
+| Feature | Notes |
 |---------|-------|
 | Vulkan PBR + shadow maps | Every frame |
 | GPU-driven rendering (compute cull + indirect draw) | Main render pass |
-| 4-level LOD system | Far objects auto-switch LOD |
-| SSAO (disabled with MSAA > 1) | Ambient occlusion pass |
+| 4-level LOD system | Distance-based hard switch |
+| SSAO | Reconstructed from depth (disabled with MSAA > 1) |
 | Bloom | Post-process pass |
 | MSAA 4× | Anti-aliasing |
 | Day/night cycle | Sun rotates, sky tints, street lights toggle |
-| ECS (hecs) | Transform, MeshRenderer, Vehicle, Checkpoint, StreetLight … |
-| Rapier 3D physics | Rigid bodies, collision impacts |
-| Spatial audio (rodio) | Engine pitch (RPM), tyre squeal, wind, impacts |
-| Lua scripting (mlua) | `scripts/game.lua` — hot-reloaded |
+| ECS (hecs) | Transform, MeshRenderer, PhysicsBody, StreetLight … |
+| Rapier 3D physics | Rigid bodies, ray-cast grounded detection, jump impulse |
+| Spatial audio (rodio) | Footsteps, jump, land, placement, delete, impacts |
+| Lua scripting (mlua) | Hot-reloaded scripts in `scripts/` |
 | Async asset loading | GLB parsed on background thread |
 | Shader hot-reload | Edit GLSL → reloads in ≤ 1 s |
-| egui debug panels | Stats, GPU profiler, lights, LOD, day/night, vehicle audio … |
-| Gamepad support (gilrs) | Axis steering + camera look |
+| egui debug panels | Stats, GPU profiler, lights, LOD, day/night, props catalog |
+| Gamepad support (gilrs) | Analog stick + jump button |
+| Scene persistence | Auto-save on exit, exact restore on continue |
+| Props catalog | External JSON — add content without touching code |
 
 ---
 
-## Checkpoint layout (top view)
+## Built with ralk
 
-```
-          CP 0 (0, 6)
-             ●
-            / \
-           /   \
-CP 3 ●---+     +--- CP 1
-(finish)   \   /   (-7, 0)     (7, 0)
-            \ /
-             ●
-          CP 2 (0, -6)
-```
-
-Trigger radius: **2.5 m** sphere.
-Vehicle position proxy: camera position (full raycast-suspension vehicle pending Fase 27).
-
----
-
-## Built with vibe-engine
-
-[vibe-engine (ralk)](../../README.md) — a Vulkan-first 3D engine written in Rust.
-`ash 0.38` · `glam 0.29` · `hecs` · `rapier3d` · `rodio` · `egui` · `mlua`
+[ralk](../../README.md) — a Vulkan-first 3D engine in Rust.
+`ash 0.38` · `glam 0.29` · `hecs` · `rapier3d 0.22` · `rodio 0.19` · `egui 0.33` · `mlua`

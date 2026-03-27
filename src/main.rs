@@ -20,9 +20,10 @@ mod scripting;
 mod ui;
 
 use asset::{
-    AssetLoader, AudioSourceDef, ColliderDef, DirLightDef, EntityDef, PointLightDef,
-    RigidBodyDef, SceneData, SceneFile, ShaderCompiler, load_multi_glb, load_scene_file,
-    save_scene_file,
+    AppConfig, AssetLoader, AudioSourceDef, ColliderDef, DirLightDef, EntityDef, PlacedProp,
+    PlayerState, PointLightDef, PropDef, PropPhysics, RigidBodyDef, SceneConfig, SceneData,
+    SceneFile, ShaderCompiler, load_config, load_multi_glb, load_props_catalog, load_scene_file,
+    save_config, save_scene_file,
 };
 use audio::{AudioEngine, ensure_sample_sounds};
 use physics::{PhysicsWorld, RigidBodyHandle};
@@ -40,11 +41,15 @@ use scene::{
     hit_test_gizmo, ray_aabb, screen_to_ray,
 };
 use scripting::{ScriptCommand, ScriptEngine};
-use ui::{AudioUiState, DayNightUiState, DebugSettings, DebugUi, EditorUiState, FrameStats,
-         GameAction, GameHudState, GameStateKind, PhysicsUiState, SceneUiState,
-         ScriptingUiState, VehicleAudioUiState};
+use ui::{
+    AppScreen, AudioUiState, DayNightUiState, DebugSettings, DebugUi, EditorUiState,
+    FrameStats, GameAction, GameHudState, GameStateKind, MainMenuUiState, PhysicsUiState,
+    PlacementState, PropsUiState, SceneUiState, ScriptingUiState, SettingsUiState,
+    VehicleAudioUiState,
+};
 
 const TICK_RATE: f32 = 1.0 / 60.0;
+const DEFAULT_PROPS_CATALOG: &str = "assets/props/default_props.json";
 
 // ---------------------------------------------------------------------------
 // Game logic types
@@ -64,6 +69,18 @@ struct GameSession {
 }
 const GAMEPAD_DEAD_ZONE: f32 = 0.15;
 const SCENE_PATH: &str = "scene.json";
+const SCENES_DIR: &str = "scenes";
+const LAST_SESSION_PATH: &str = "scenes/.last_session.json";
+
+/// One entry in the undo stack: stores enough info to despawn the last placed entity.
+struct UndoEntry {
+    entity: hecs::Entity,
+}
+
+/// ECS tag component marking an entity as a placed prop (Fase 36).
+struct PlacedPropTag {
+    prop_id: String,
+}
 
 struct App {
     window: Option<Arc<Window>>,
@@ -116,8 +133,38 @@ struct App {
     vehicle_audio_ui: VehicleAudioUiState,
     game: GameSession,
     game_hud: GameHudState,
-    /// Physics body for the player capsule. Set in `resumed()`, used every tick.
+    /// Physics body for the player capsule. Set when entering a scene.
     player_body: Option<RigidBodyHandle>,
+
+    // ---- Fase 33: jump -----------------------------------------------------
+    /// Whether the player is touching the ground this tick.
+    player_is_grounded: bool,
+    /// Whether the player was grounded last tick (for land sound detection).
+    player_was_grounded: bool,
+    /// Coyote time: seconds left after walking off a ledge during which jump still works.
+    coyote_timer: f32,
+    /// Footstep timer: counts down; footstep sound plays when it reaches 0.
+    footstep_timer: f32,
+
+    // ---- Fase 34: app screens ----------------------------------------------
+    /// Current application screen.
+    app_screen: AppScreen,
+    /// Main menu UI state.
+    main_menu_ui: MainMenuUiState,
+    /// Settings / scene creation screen state.
+    settings_ui: SettingsUiState,
+    /// Name of the currently loaded scene file (without path/extension).
+    current_scene_name: String,
+
+    // ---- Fase 36: props catalog + placement --------------------------------
+    /// Loaded props catalog entries.
+    props_catalog: Vec<PropDef>,
+    /// Props panel UI state.
+    props_ui: PropsUiState,
+    /// Active placement mode.
+    placement: PlacementState,
+    /// Undo stack for prop placement.
+    undo_stack: Vec<UndoEntry>,
 }
 
 impl App {
@@ -125,7 +172,14 @@ impl App {
         // Generate placeholder audio assets on first run.
         ensure_sample_sounds();
 
-        let (scene_data, model_paths) = initial_scene_load();
+        let cfg = load_config();
+
+        // Ensure scenes/ directory exists.
+        let _ = std::fs::create_dir_all(SCENES_DIR);
+
+        // Start with just the builtin cube — real scene loaded when entering.
+        let scene_data = asset::builtin_cube();
+        let model_paths: Vec<String> = vec![];
         let cube_mesh_index = scene_data.meshes.len().saturating_sub(1);
         let shader_compiler = ShaderCompiler::new("shaders")
             .map_err(|e| log::warn!("Shader hot-reload disabled: {e}"))
@@ -169,16 +223,20 @@ impl App {
             last_drawn: 0,
             last_total: 0,
             debug_settings: DebugSettings {
-                tone_aces: false,
-                msaa_samples: 4,
+                tone_aces: cfg.tone_aces,
+                msaa_samples: cfg.msaa,
                 msaa_max: 4,
-                ssao_enabled: true,
-                ssao_radius: 0.5,
-                ssao_bias: 0.025,
-                ssao_power: 2.0,
-                ssao_strength: 1.0,
-                ssao_sample_count: 32,
-                lod_distance_step: 10.0,
+                ssao_enabled: cfg.ssao,
+                ssao_radius: cfg.ssao_radius,
+                ssao_bias: cfg.ssao_bias,
+                ssao_power: cfg.ssao_power,
+                ssao_strength: cfg.ssao_strength,
+                ssao_sample_count: cfg.ssao_samples,
+                lod_distance_step: cfg.lod_distance_step,
+                bloom_enabled: cfg.bloom,
+                bloom_intensity: cfg.bloom_intensity,
+                bloom_threshold: cfg.bloom_threshold,
+                ibl_scale: cfg.ibl_scale,
             },
             scene_ui: SceneUiState {
                 save_clicked: false,
@@ -191,9 +249,10 @@ impl App {
             physics_ui: PhysicsUiState {
                 spawn_cube_clicked: false,
                 show_wireframe: false,
+                jump_force: 5.5,
             },
             audio_engine: AudioEngine::new(),
-            audio_ui: AudioUiState { master_volume: 1.0, muted: false },
+            audio_ui: AudioUiState { master_volume: cfg.master_volume, muted: cfg.muted },
             selected_entity: None,
             gizmo_mode: GizmoMode::Translate,
             gizmo_drag: None,
@@ -237,6 +296,51 @@ impl App {
                 action:    GameAction::default(),
             },
             player_body: None,
+            player_is_grounded: false,
+            player_was_grounded: false,
+            coyote_timer: 0.0,
+            footstep_timer: 0.0,
+            app_screen: AppScreen::MainMenu,
+            main_menu_ui: MainMenuUiState {
+                action: Default::default(),
+                has_last_session: false,
+                saved_scenes: Vec::new(),
+            },
+            settings_ui: SettingsUiState {
+                action_create: false,
+                action_back: false,
+                scene_name: "mi_escena".to_string(),
+                skybox_options: Vec::new(),
+                selected_skybox: 0,
+                terrain_options: Vec::new(),
+                selected_terrain: 0,
+                character_options: Vec::new(),
+                selected_character: 0,
+                catalog_options: Vec::new(),
+                selected_catalog: 0,
+                msaa: 4,
+                ssao: true,
+                bloom: true,
+            },
+            current_scene_name: String::new(),
+            props_catalog: load_props_catalog(DEFAULT_PROPS_CATALOG)
+                .map(|c| c.props)
+                .unwrap_or_default(),
+            props_ui: PropsUiState {
+                open: false,
+                category_filter: String::new(),
+                search: String::new(),
+                selected_prop: None,
+                place_clicked: None,
+                delete_clicked: false,
+                duplicate_clicked: false,
+                undo_clicked: false,
+                grid_snap: false,
+                grid_size: 1.0,
+                catalog_entries: Vec::new(),
+            },
+            placement: PlacementState::None,
+            undo_stack: Vec::new(),
         }
     }
 
@@ -533,6 +637,24 @@ impl App {
         ));
     }
 
+    /// Spawn a minimal 40×40 static ground plane using the builtin cube mesh.
+    /// Called when loading a scene file that has no static physics bodies.
+    fn spawn_default_ground(&mut self) {
+        let cube = self.cube_mesh_index;
+        let default_mat = self.scene_data.materials.len();
+        let pos = Vec3::new(0.0, -0.25, 0.0);
+        let half = Vec3::new(20.0, 0.25, 20.0);
+        let (bh, ch) = self.physics.add_static_box(pos, half, 0.4, 0.7);
+        let mesh_bbox = Vec3::splat(0.5);
+        self.world.spawn((
+            Transform { position: pos, rotation: Quat::IDENTITY, scale: half * 2.0 },
+            MeshRenderer { mesh_index: cube, material_set_index: default_mat },
+            BoundingBox { min: -mesh_bbox, max: mesh_bbox },
+            PhysicsBody { handle: bh, body_type: PhysicsBodyType::Static },
+            PhysicsCollider { handle: ch, shape: ColliderShapeType::Box, half_extents: half },
+        ));
+    }
+
     /// Save the current world state to `scene.json`.
     fn save_scene(&self) -> Result<()> {
         let mut entities: Vec<EntityDef> = Vec::new();
@@ -594,14 +716,117 @@ impl App {
         let scripts = self.script_engine.as_ref()
             .map(|se| se.scripts.iter().map(|s| s.path.clone()).collect())
             .unwrap_or_default();
+
+        // Collect player state.
+        let player_pos = if let Some(h) = self.player_body {
+            self.physics.get_dynamic_pose(h).map(|(p, _)| p).unwrap_or(Vec3::new(0.0, PLAYER_SPAWN_Y, 5.0))
+        } else {
+            Vec3::new(0.0, PLAYER_SPAWN_Y, 5.0)
+        };
+        let player = PlayerState {
+            position: player_pos.to_array(),
+            camera_yaw: self.camera.yaw,
+            camera_pitch: self.camera.pitch,
+        };
+
+        // Collect placed props.
+        let placed_props: Vec<PlacedProp> = self.world
+            .query::<(&Transform, &PlacedPropTag)>()
+            .iter()
+            .map(|(_, (t, tag))| PlacedProp {
+                prop_id: tag.prop_id.clone(),
+                model: String::new(), // resolved at load time from catalog
+                position: t.position.to_array(),
+                rotation: t.rotation.to_array(),
+                scale: t.scale.to_array(),
+            })
+            .collect();
+
         let sf = SceneFile {
+            config: SceneConfig::default(),
+            player,
+            time_of_day: self.day_night_ui.time_of_day,
+            day_night_speed: 1.0,
             models: self.model_paths.clone(),
             entities,
+            placed_props,
             directional_light: dir_light,
             point_lights,
             scripts,
         };
         save_scene_file(SCENE_PATH, &sf)
+    }
+
+    /// Save current session to `scenes/.last_session.json` for "Continuar".
+    fn save_session(&self) -> Result<()> {
+        let mut entities: Vec<EntityDef> = Vec::new();
+        for (entity, (transform, mr)) in self.world.query::<(&Transform, &MeshRenderer)>().iter() {
+            let rigid_body = self.world.get::<&PhysicsBody>(entity).ok().map(|pb| RigidBodyDef {
+                body_type: match pb.body_type {
+                    PhysicsBodyType::Dynamic => "dynamic".to_string(),
+                    PhysicsBodyType::Static => "static".to_string(),
+                    PhysicsBodyType::Kinematic => "kinematic".to_string(),
+                },
+            });
+            let collider = self.world.get::<&PhysicsCollider>(entity).ok().map(|pc| ColliderDef {
+                half_extents: pc.half_extents.to_array(),
+                restitution: 0.4,
+                friction: 0.5,
+            });
+            entities.push(EntityDef {
+                mesh_index: mr.mesh_index,
+                material_set_index: mr.material_set_index,
+                position: transform.position.to_array(),
+                rotation: transform.rotation.to_array(),
+                scale: transform.scale.to_array(),
+                rigid_body,
+                collider,
+                audio_source: None,
+            });
+        }
+        let mut dir_light = DirLightDef { direction: [0.4, -1.0, -0.6], color: [1.0; 3], intensity: 1.2 };
+        for (_, light) in self.world.query::<&DirectionalLight>().iter() {
+            dir_light = DirLightDef { direction: light.direction.to_array(), color: light.color.to_array(), intensity: light.intensity };
+        }
+        let point_lights: Vec<PointLightDef> = self.world.query::<(&Transform, &PointLight)>().iter()
+            .map(|(_, (t, l))| PointLightDef { position: t.position.to_array(), color: l.color.to_array(), intensity: l.intensity, radius: l.radius })
+            .collect();
+
+        let player_pos = if let Some(h) = self.player_body {
+            self.physics.get_dynamic_pose(h).map(|(p, _)| p).unwrap_or(Vec3::new(0.0, PLAYER_SPAWN_Y, 5.0))
+        } else {
+            Vec3::new(0.0, PLAYER_SPAWN_Y, 5.0)
+        };
+        let placed_props: Vec<PlacedProp> = self.world
+            .query::<(&Transform, &PlacedPropTag)>()
+            .iter()
+            .map(|(_, (t, tag))| PlacedProp {
+                prop_id: tag.prop_id.clone(),
+                model: String::new(),
+                position: t.position.to_array(),
+                rotation: t.rotation.to_array(),
+                scale: t.scale.to_array(),
+            })
+            .collect();
+
+        let sf = SceneFile {
+            config: SceneConfig::default(),
+            player: PlayerState {
+                position: player_pos.to_array(),
+                camera_yaw: self.camera.yaw,
+                camera_pitch: self.camera.pitch,
+            },
+            time_of_day: self.day_night_ui.time_of_day,
+            day_night_speed: 1.0,
+            models: self.model_paths.clone(),
+            entities,
+            placed_props,
+            directional_light: dir_light,
+            point_lights,
+            scripts: Vec::new(),
+        };
+        let _ = std::fs::create_dir_all(SCENES_DIR);
+        save_scene_file(LAST_SESSION_PATH, &sf)
     }
 
     /// Kick off an async load of `scene.json`. Returns immediately; the main loop
@@ -612,6 +837,28 @@ impl App {
         self.pending_scene_file = Some(sf.clone());
         self.asset_loader.request_load(sf.models);
         self.scene_ui.status = "Loading...".into();
+        Ok(())
+    }
+
+    /// Start loading a scene file. Kicks off async model load; `apply_loaded_scene` finishes it.
+    fn load_scene_file_async(&mut self, path: &str) -> Result<()> {
+        let sf = load_scene_file(path)?;
+        // Load props catalog — use scene config path or fall back to default.
+        let catalog_path = if sf.config.props_catalog.is_empty() {
+            DEFAULT_PROPS_CATALOG
+        } else {
+            &sf.config.props_catalog
+        };
+        if let Ok(catalog) = load_props_catalog(catalog_path) {
+            self.props_catalog = catalog.props;
+        } else if let Ok(catalog) = load_props_catalog(DEFAULT_PROPS_CATALOG) {
+            self.props_catalog = catalog.props;
+        }
+        self.day_night_ui.time_of_day = sf.time_of_day;
+        self.pending_scene_file = Some(sf.clone());
+        self.asset_loader.request_load(sf.models.clone());
+        self.scene_ui.status = "Cargando...".into();
+        self.scene_ui.is_loading = true;
         Ok(())
     }
 
@@ -638,10 +885,98 @@ impl App {
             if let Some(ref mut se) = self.script_engine {
                 se.reload_scripts(&sf.scripts);
             }
+            // If no static physics bodies were loaded, spawn a default ground plane.
+            let has_static = self.world.query::<&PhysicsBody>().iter()
+                .any(|(_, pb)| pb.body_type == PhysicsBodyType::Static);
+            if !has_static {
+                self.spawn_default_ground();
+            }
+            // Restore player state.
+            let start = Vec3::from(sf.player.position);
+            self.spawn_player_at(start);
+            self.camera.yaw = sf.player.camera_yaw;
+            self.camera.pitch = sf.player.camera_pitch;
+            // Spawn scene lights if no lights were in the scene file.
+            self.ensure_scene_lights();
         } else {
             self.spawn_sandbox_scene();
+            let player_start = Vec3::new(0.0, PLAYER_SPAWN_Y, 5.0);
+            self.spawn_player_at(player_start);
+            self.ensure_scene_lights();
         }
+
+        self.undo_stack.clear();
+        self.placement = PlacementState::None;
+        self.app_screen = AppScreen::InScene;
+        self.game.state = GameState::Exploring;
+        self.game_hud.kind = GameStateKind::Exploring;
+        self.capture_mouse();
         Ok(())
+    }
+
+    /// Spawn the player capsule at the given position. Creates physics body + sets camera.
+    fn spawn_player_at(&mut self, pos: Vec3) {
+        let body_handle = self.physics.add_player_capsule(pos);
+        self.player_body = Some(body_handle);
+        self.camera.position = Vec3::new(pos.x, pos.y + EYE_OFFSET, pos.z);
+        self.player_is_grounded = false;
+        self.player_was_grounded = false;
+        self.coyote_timer = 0.0;
+        self.footstep_timer = 0.0;
+    }
+
+    /// Ensure directional light + ambient audio exist after scene load.
+    fn ensure_scene_lights(&mut self) {
+        let has_dir = self.world.query::<&DirectionalLight>().iter().count() > 0;
+        if !has_dir {
+            self.world.spawn((
+                Transform::from_position(Vec3::ZERO),
+                DirectionalLight {
+                    direction: Vec3::new(0.4, -1.0, -0.6).normalize(),
+                    color: Vec3::ONE,
+                    intensity: 1.5,
+                },
+            ));
+        }
+        // Street lights.
+        for &pos in &[
+            Vec3::new( 4.0, 3.0,  4.0),
+            Vec3::new(-4.0, 3.0,  4.0),
+            Vec3::new( 4.0, 3.0, -4.0),
+            Vec3::new(-4.0, 3.0, -4.0),
+        ] {
+            self.world.spawn((
+                Transform::from_position(pos),
+                PointLight { color: Vec3::ONE, intensity: 0.0, radius: 15.0 },
+                StreetLight { base_intensity: 10.0 },
+            ));
+        }
+        // Ambient audio.
+        let has_ambient = self.world.query::<&AudioSource>().iter().any(|(_, a)| a.looping);
+        if !has_ambient {
+            self.world.spawn((
+                Transform::from_position(Vec3::ZERO),
+                AudioSource {
+                    sound_path: "assets/sounds/ambient.wav".to_string(),
+                    volume: 0.3,
+                    looping: true,
+                    max_distance: 50.0,
+                    handle: None,
+                },
+            ));
+        }
+    }
+
+    /// Scan asset directories and refresh the settings screen dropdown options.
+    fn refresh_settings_options(&mut self) {
+        self.settings_ui.skybox_options = scan_dir_files("assets/skyboxes", "hdr");
+        self.settings_ui.terrain_options = scan_dir_files("assets/terrains", "json");
+        self.settings_ui.character_options = scan_dir_files("assets/characters", "glb");
+        self.settings_ui.catalog_options = scan_dir_files("assets/props", "json");
+        self.settings_ui.selected_skybox = 0;
+        self.settings_ui.selected_terrain = 0;
+        self.settings_ui.selected_character = 0;
+        self.settings_ui.selected_catalog = 0;
     }
 
     /// Spawn a physics cube at an arbitrary world-space position.
@@ -738,7 +1073,7 @@ impl App {
         let tone_mode = if self.debug_settings.tone_aces { 1.0_f32 } else { 0.0_f32 };
         let frustum = extract_frustum_planes(view_proj);
         LightingUbo {
-            dir_light_dir:     dir_dir.extend(0.0).into(),
+            dir_light_dir:     dir_dir.extend(self.debug_settings.ibl_scale).into(),
             dir_light_color:   Vec4::from((dir_color, dir_intensity)).into(),
             point_light_pos:   pt_pos.extend(0.0).into(),
             point_light_color: Vec4::from((pt_color, pt_intensity)).into(),
@@ -891,9 +1226,95 @@ impl App {
 
     /// Advance the game state and sync to `game_hud`.
     ///
-    /// Consumes one-frame actions produced by the previous frame's egui overlay,
-    /// then resets them. No racing logic — just pause/resume/quit.
+    /// Also handles main menu / settings actions (Fase 34-35).
     fn update_game(&mut self, _dt: f32) {
+        // ---- Main menu actions ----
+        if self.app_screen == AppScreen::MainMenu {
+            let cont = self.main_menu_ui.action.continue_game;
+            let new  = self.main_menu_ui.action.new_scene;
+            let quit = self.main_menu_ui.action.quit;
+            let load = self.main_menu_ui.action.load_scene.take();
+            self.main_menu_ui.action = Default::default();
+
+            if quit {
+                self.game.exit_requested = true;
+            }
+            if new {
+                self.refresh_settings_options();
+                self.app_screen = AppScreen::Settings;
+            }
+            if cont {
+                if let Err(e) = self.load_scene_file_async(LAST_SESSION_PATH) {
+                    log::warn!("Could not load last session: {e}");
+                } else {
+                    log::info!("Loading last session…");
+                }
+            }
+            if let Some(name) = load {
+                let path = format!("{SCENES_DIR}/{name}.json");
+                if let Err(e) = self.load_scene_file_async(&path) {
+                    log::warn!("Could not load scene '{name}': {e}");
+                }
+            }
+            return;
+        }
+
+        // ---- Settings screen actions ----
+        if self.app_screen == AppScreen::Settings {
+            let create = self.settings_ui.action_create;
+            let back   = self.settings_ui.action_back;
+            self.settings_ui.action_create = false;
+            self.settings_ui.action_back   = false;
+
+            if back {
+                self.app_screen = AppScreen::MainMenu;
+            }
+            if create {
+                let name = self.settings_ui.scene_name.trim().to_string();
+                let skybox = self.settings_ui.skybox_options
+                    .get(self.settings_ui.selected_skybox).cloned().unwrap_or_default();
+                let terrain = self.settings_ui.terrain_options
+                    .get(self.settings_ui.selected_terrain).cloned().unwrap_or_default();
+                let catalog = self.settings_ui.catalog_options
+                    .get(self.settings_ui.selected_catalog).cloned().unwrap_or_default();
+
+                let sf = SceneFile {
+                    config: SceneConfig { skybox, terrain, character: String::new(), props_catalog: catalog },
+                    player: PlayerState::default(),
+                    time_of_day: 0.0,
+                    day_night_speed: 1.0,
+                    models: Vec::new(),
+                    entities: Vec::new(),
+                    placed_props: Vec::new(),
+                    directional_light: DirLightDef { direction: [0.4, -1.0, -0.6], color: [1.0; 3], intensity: 1.5 },
+                    point_lights: Vec::new(),
+                    scripts: Vec::new(),
+                };
+                let path = format!("{SCENES_DIR}/{name}.json");
+                if let Err(e) = save_scene_file(&path, &sf) {
+                    log::warn!("Could not save new scene: {e}");
+                } else {
+                    self.current_scene_name = name;
+                    // Enter with empty sandbox layout.
+                    let catalog_path = if sf.config.props_catalog.is_empty() {
+                        DEFAULT_PROPS_CATALOG
+                    } else {
+                        &sf.config.props_catalog
+                    };
+                    if let Ok(catalog) = load_props_catalog(catalog_path) {
+                        self.props_catalog = catalog.props;
+                    } else if let Ok(catalog) = load_props_catalog(DEFAULT_PROPS_CATALOG) {
+                        self.props_catalog = catalog.props;
+                    }
+                    self.pending_scene_file = Some(sf);
+                    self.asset_loader.request_load(Vec::new());
+                    self.scene_ui.is_loading = true;
+                }
+            }
+            return;
+        }
+
+        // ---- In-scene: pause/resume/quit ----
         let resume = self.game_hud.action.resume;
         let quit   = self.game_hud.action.quit;
         self.game_hud.action = GameAction::default();
@@ -903,7 +1324,67 @@ impl App {
             self.capture_mouse();
         }
         if quit {
-            self.game.exit_requested = true;
+            // Auto-save before quitting.
+            if let Err(e) = self.save_session() {
+                log::warn!("Auto-save failed: {e}");
+            }
+            self.main_menu_ui.has_last_session = std::path::Path::new(LAST_SESSION_PATH).exists();
+            self.main_menu_ui.saved_scenes = scan_saved_scenes();
+            // Clear scene and go back to main menu.
+            self.world = hecs::World::new();
+            self.physics = PhysicsWorld::new();
+            self.player_body = None;
+            self.undo_stack.clear();
+            self.placement = PlacementState::None;
+            self.release_mouse();
+            self.app_screen = AppScreen::MainMenu;
+            self.game.state = GameState::Exploring;
+            self.game_hud.kind = GameStateKind::Exploring;
+            return;
+        }
+
+        // ---- Props UI actions ----
+        let delete_clicked = self.props_ui.delete_clicked;
+        let duplicate_clicked = self.props_ui.duplicate_clicked;
+        let undo_clicked = self.props_ui.undo_clicked;
+        self.props_ui.delete_clicked = false;
+        self.props_ui.duplicate_clicked = false;
+        self.props_ui.undo_clicked = false;
+
+        if delete_clicked {
+            if let Some(entity) = self.selected_entity.take() {
+                let _ = self.world.despawn(entity);
+                if let Some(ref mut audio) = self.audio_engine {
+                    audio.play_sound("assets/sounds/delete.wav", 0.4, false);
+                }
+            }
+        }
+        if undo_clicked {
+            if let Some(entry) = self.undo_stack.pop() {
+                let _ = self.world.despawn(entry.entity);
+            }
+        }
+        if duplicate_clicked {
+            if let Some(entity) = self.selected_entity {
+                // Collect all needed data first, then drop borrows before spawning.
+                let data = {
+                    let t = self.world.get::<&Transform>(entity).ok();
+                    let m = self.world.get::<&MeshRenderer>(entity).ok();
+                    let b = self.world.get::<&BoundingBox>(entity).ok();
+                    match (t, m, b) {
+                        (Some(t), Some(m), Some(b)) => Some((
+                            Transform { position: t.position + Vec3::new(1.0, 0.0, 0.0), rotation: t.rotation, scale: t.scale },
+                            MeshRenderer { mesh_index: m.mesh_index, material_set_index: m.material_set_index },
+                            BoundingBox { min: b.min, max: b.max },
+                        )),
+                        _ => None,
+                    }
+                };
+                if let Some((new_transform, mr, bbox)) = data {
+                    let new_entity = self.world.spawn((new_transform, mr, bbox));
+                    self.undo_stack.push(UndoEntry { entity: new_entity });
+                }
+            }
         }
 
         // --- Pull vehicle telemetry for HUD ---
@@ -979,6 +1460,14 @@ impl App {
             move_xy.y = if ly.abs() > GAMEPAD_DEAD_ZONE { ly } else { 0.0 };
             look_xy.x = if rx.abs() > GAMEPAD_DEAD_ZONE { rx } else { 0.0 };
             look_xy.y = if ry.abs() > GAMEPAD_DEAD_ZONE { ry } else { 0.0 };
+            break;
+        }
+
+        // South button (A on Xbox / Cross on PS) = jump.
+        for (_id, gamepad) in gilrs.gamepads() {
+            if gamepad.is_pressed(gilrs::Button::South) {
+                self.input.jump = true;
+            }
             break;
         }
 
@@ -1128,47 +1617,12 @@ impl ApplicationHandler for App {
                 self.debug_ui = Some(DebugUi::new(&window));
                 self.window = Some(window);
 
-                // Always start with the sandbox scene.
-                // scene.json is only used when the user explicitly clicks Load in the UI.
-                self.spawn_sandbox_scene();
-
-                // Player capsule — dynamic body, rotation locked, no ECS entity.
-                // Ground top at y=0; capsule half_height=0.5 + radius=0.4 → 1.8 m tall.
-                // Center spawns at y=0.9 so feet touch the ground.
-                let player_start = Vec3::new(0.0, PLAYER_SPAWN_Y, 5.0);
-                self.player_body = Some(self.physics.add_player_capsule(player_start));
-                self.camera.position = Vec3::new(player_start.x, player_start.y + EYE_OFFSET, player_start.z);
-
-                // Street lights (Fase 29): 4 lamps around the scene, activated at night.
-                for &pos in &[
-                    Vec3::new( 4.0, 3.0,  4.0),
-                    Vec3::new(-4.0, 3.0,  4.0),
-                    Vec3::new( 4.0, 3.0, -4.0),
-                    Vec3::new(-4.0, 3.0, -4.0),
-                ] {
-                    self.world.spawn((
-                        Transform::from_position(pos),
-                        PointLight { color: Vec3::ONE, intensity: 0.0, radius: 15.0 },
-                        StreetLight { base_intensity: 10.0 },
-                    ));
-                }
-
-                // Ambient audio source (loops throughout the session).
-                self.world.spawn((
-                    Transform::from_position(Vec3::ZERO),
-                    AudioSource {
-                        sound_path: "assets/sounds/ambient.wav".to_string(),
-                        volume: 0.3,
-                        looping: true,
-                        max_distance: 50.0,
-                        handle: None,
-                    },
-                ));
-
-                self.scene_ui.model_count = self.model_paths.len();
-                self.scene_ui.entity_count = self.world.len() as usize;
-
-                self.capture_mouse();
+                // Start at main menu — no scene spawned yet.
+                self.app_screen = AppScreen::MainMenu;
+                self.main_menu_ui.has_last_session =
+                    std::path::Path::new(LAST_SESSION_PATH).exists();
+                self.main_menu_ui.saved_scenes = scan_saved_scenes();
+                self.refresh_settings_options();
             }
             Err(e) => {
                 log::error!("Failed to initialize Vulkan: {e:#}");
@@ -1218,16 +1672,31 @@ impl ApplicationHandler for App {
                         KeyCode::KeyE if !self.mouse_captured && pressed => self.gizmo_mode = GizmoMode::Rotate,
                         KeyCode::KeyR if !self.mouse_captured && pressed => self.gizmo_mode = GizmoMode::Scale,
                         KeyCode::ShiftLeft | KeyCode::ShiftRight => self.input.sprint = pressed,
-                        KeyCode::Space if self.mouse_captured => self.input.brake = pressed,
+                        KeyCode::Space if self.mouse_captured && pressed => self.input.jump = true,
+                        KeyCode::KeyG if !self.mouse_captured && pressed => {
+                            self.props_ui.grid_snap = !self.props_ui.grid_snap;
+                        }
                         KeyCode::Escape if pressed => {
-                            match self.game.state {
-                                GameState::Exploring => {
-                                    self.release_mouse();
-                                    self.game.state = GameState::Paused;
-                                }
-                                GameState::Paused => {
-                                    self.game.state = GameState::Exploring;
-                                    self.capture_mouse();
+                            // Cancel placement mode first.
+                            if self.placement != PlacementState::None {
+                                self.placement = PlacementState::None;
+                                self.props_ui.selected_prop = None;
+                            } else {
+                                match (self.app_screen, self.game.state) {
+                                    (AppScreen::Settings, _) => {
+                                        self.app_screen = AppScreen::MainMenu;
+                                    }
+                                    (AppScreen::InScene, GameState::Exploring) => {
+                                        self.release_mouse();
+                                        self.game.state = GameState::Paused;
+                                        self.game_hud.kind = GameStateKind::Paused;
+                                    }
+                                    (AppScreen::InScene, GameState::Paused) => {
+                                        self.game.state = GameState::Exploring;
+                                        self.game_hud.kind = GameStateKind::Exploring;
+                                        self.capture_mouse();
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -1303,7 +1772,68 @@ impl ApplicationHandler for App {
                 ..
             } if !egui_consumed => {
                 if !self.mouse_captured {
-                    if self.hovered_gizmo_axis.is_some() {
+                    // Placement mode: ray-cast to y=0 ground plane and spawn prop.
+                    if let PlacementState::Active { ref prop_id, preview_rotation_y, preview_scale } = self.placement.clone() {
+                        let ws = self.window_size;
+                        let (ray_o, ray_d) = screen_to_ray(self.mouse_pos, ws, &self.camera);
+                        // Intersect with horizontal ground plane y = 0 (or nearest floor).
+                        let place_y = 0.0f32;
+                        let ground_pos = if ray_d.y.abs() > 0.001 {
+                            let t = (place_y - ray_o.y) / ray_d.y;
+                            if t > 0.0 {
+                                let mut p = ray_o + ray_d * t;
+                                // Grid snap.
+                                if self.props_ui.grid_snap {
+                                    let g = self.props_ui.grid_size;
+                                    p.x = (p.x / g).round() * g;
+                                    p.z = (p.z / g).round() * g;
+                                }
+                                Some(Vec3::new(p.x, place_y + 0.5, p.z))
+                            } else { None }
+                        } else { None };
+
+                        if let Some(spawn_pos) = ground_pos {
+                            let rot = Quat::from_rotation_y(preview_rotation_y);
+                            let prop_id_clone = prop_id.clone();
+
+                            // Find physics type and default scale from catalog.
+                            let (is_dynamic, catalog_scale) = self.props_catalog.iter()
+                                .find(|p| p.id == prop_id_clone)
+                                .map(|p| (p.physics == PropPhysics::Dynamic, Vec3::from(p.scale)))
+                                .unwrap_or((false, Vec3::ONE));
+
+                            let scale = catalog_scale * preview_scale;
+                            // Snap spawn Y so the bottom of the prop sits on the ground.
+                            let spawn_pos = Vec3::new(spawn_pos.x, scale.y * 0.5, spawn_pos.z);
+                            let half = scale * 0.5;
+
+                            let transform = Transform { position: spawn_pos, rotation: rot, scale };
+                            let bbox = BoundingBox { min: -Vec3::splat(0.5), max: Vec3::splat(0.5) };
+                            let mr = MeshRenderer { mesh_index: self.cube_mesh_index, material_set_index: self.scene_data.materials.len() };
+
+                            let entity = if is_dynamic {
+                                let (bh, ch) = self.physics.add_dynamic_box(spawn_pos, half, 0.4, 0.5);
+                                self.world.spawn((
+                                    transform, mr, bbox,
+                                    PhysicsBody { handle: bh, body_type: PhysicsBodyType::Dynamic },
+                                    PhysicsCollider { handle: ch, shape: ColliderShapeType::Box, half_extents: half },
+                                    PlacedPropTag { prop_id: prop_id_clone.clone() },
+                                ))
+                            } else {
+                                let (bh, ch) = self.physics.add_static_box(spawn_pos, half, 0.4, 0.7);
+                                self.world.spawn((
+                                    transform, mr, bbox,
+                                    PhysicsBody { handle: bh, body_type: PhysicsBodyType::Static },
+                                    PhysicsCollider { handle: ch, shape: ColliderShapeType::Box, half_extents: half },
+                                    PlacedPropTag { prop_id: prop_id_clone.clone() },
+                                ))
+                            };
+                            self.undo_stack.push(UndoEntry { entity });
+                            if let Some(ref mut audio) = self.audio_engine {
+                                audio.play_sound("assets/sounds/placement.wav", 0.4, false);
+                            }
+                        }
+                    } else if self.hovered_gizmo_axis.is_some() {
                         // Start gizmo drag.
                         if let Some(entity) = self.selected_entity {
                             if let Ok(transform) = self.world.get::<&Transform>(entity) {
@@ -1389,6 +1919,55 @@ impl ApplicationHandler for App {
                     if let Some(handle) = self.player_body {
                         let xz_vel = self.camera.desired_move_velocity(&self.input);
                         self.physics.set_horizontal_velocity(handle, xz_vel);
+
+                        // Ground check via ray cast.
+                        self.player_was_grounded = self.player_is_grounded;
+                        self.player_is_grounded = self.physics.is_grounded(handle);
+
+                        // Coyote time.
+                        if self.player_is_grounded {
+                            self.coyote_timer = 0.1;
+                        } else {
+                            self.coyote_timer = (self.coyote_timer - TICK_RATE).max(0.0);
+                        }
+
+                        // Jump impulse.
+                        let can_jump = (self.player_is_grounded || self.coyote_timer > 0.0)
+                            && !self.input.ui_captured;
+                        if can_jump && self.input.jump {
+                            self.physics.apply_jump_impulse(handle, self.physics_ui.jump_force);
+                            self.input.jump = false;
+                            self.coyote_timer = 0.0;
+                            // Jump sound
+                            if let Some(ref mut audio) = self.audio_engine {
+                                audio.play_sound("assets/sounds/jump.wav", 0.5, false);
+                            }
+                        }
+
+                        // Land sound: just touched ground after being airborne.
+                        if self.player_is_grounded && !self.player_was_grounded {
+                            if let Some(ref mut audio) = self.audio_engine {
+                                audio.play_sound("assets/sounds/land.wav", 0.6, false);
+                            }
+                        }
+
+                        // Footstep sound while moving and grounded.
+                        if self.player_is_grounded && !self.input.ui_captured {
+                            let moving = self.input.forward || self.input.backward
+                                || self.input.left || self.input.right
+                                || self.input.gamepad_move.length() > 0.1;
+                            if moving {
+                                self.footstep_timer -= TICK_RATE;
+                                if self.footstep_timer <= 0.0 {
+                                    self.footstep_timer = if self.input.sprint { 0.28 } else { 0.45 };
+                                    if let Some(ref mut audio) = self.audio_engine {
+                                        audio.play_sound("assets/sounds/footstep.wav", 0.35, false);
+                                    }
+                                }
+                            } else {
+                                self.footstep_timer = 0.0;
+                            }
+                        }
                     }
 
                     // Sync kinematic ECS transforms → rapier before step.
@@ -1430,6 +2009,7 @@ impl ApplicationHandler for App {
 
                     self.accumulator -= TICK_RATE;
                 }
+                self.input.jump = false; // consumed after each accumulator cycle
                 self.input.clear_frame_deltas();
 
                 // Play impact sounds — distance-attenuated, scaled by effects_volume (Fase 30).
@@ -1639,6 +2219,21 @@ impl ApplicationHandler for App {
                 self.physics_ui.spawn_cube_clicked = false;
                 self.editor_ui.transform_changed = false;
 
+                // Sync catalog entries to props panel (done once per frame).
+                self.props_ui.catalog_entries = self.props_catalog.iter()
+                    .map(|p| (p.id.clone(), p.name.clone(), p.category.clone()))
+                    .collect();
+
+                // Handle prop placement clicks from the panel.
+                if let Some(prop_id) = self.props_ui.place_clicked.take() {
+                    self.placement = PlacementState::Active {
+                        prop_id: prop_id.clone(),
+                        preview_rotation_y: 0.0,
+                        preview_scale: 1.0,
+                    };
+                    self.props_ui.selected_prop = Some(prop_id);
+                }
+
                 let prev_msaa = self.debug_settings.msaa_samples;
                 let (egui_primitives, egui_textures_delta) =
                     if let (Some(ui), Some(window)) = (&mut self.debug_ui, &self.window) {
@@ -1664,7 +2259,24 @@ impl ApplicationHandler for App {
                             reload_log: self.reload_log.clone(),
                             gpu_timings,
                         };
-                        ui.build(window, &stats, &mut self.world, &mut self.debug_settings, &mut self.scene_ui, &mut self.physics_ui, &mut self.audio_ui, &mut self.editor_ui, &self.scripting_ui, &mut self.day_night_ui, &mut self.vehicle_audio_ui, &mut self.game_hud)
+                        ui.build(
+                            window,
+                            self.app_screen,
+                            &mut self.main_menu_ui,
+                            &mut self.settings_ui,
+                            &stats,
+                            &mut self.world,
+                            &mut self.debug_settings,
+                            &mut self.scene_ui,
+                            &mut self.physics_ui,
+                            &mut self.audio_ui,
+                            &mut self.editor_ui,
+                            &self.scripting_ui,
+                            &mut self.day_night_ui,
+                            &mut self.vehicle_audio_ui,
+                            &mut self.game_hud,
+                            &mut self.props_ui,
+                        )
                     } else {
                         (vec![], egui::TexturesDelta::default())
                     };
@@ -1737,9 +2349,9 @@ impl ApplicationHandler for App {
                         &egui_primitives,
                         egui_textures_delta,
                         egui_ppp,
-                        true,  // bloom_enabled
-                        0.8,   // bloom_intensity
-                        1.0,   // bloom_threshold
+                        self.debug_settings.bloom_enabled,
+                        self.debug_settings.bloom_intensity,
+                        self.debug_settings.bloom_threshold,
                         self.debug_settings.tone_aces,
                         self.debug_settings.ssao_enabled,
                         self.debug_settings.ssao_radius,
@@ -1810,10 +2422,74 @@ impl ApplicationHandler for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Save renderer/audio config.
+        let cfg = AppConfig {
+            msaa: self.debug_settings.msaa_samples,
+            ssao: self.debug_settings.ssao_enabled,
+            ssao_strength: self.debug_settings.ssao_strength,
+            ssao_radius: self.debug_settings.ssao_radius,
+            ssao_bias: self.debug_settings.ssao_bias,
+            ssao_power: self.debug_settings.ssao_power,
+            ssao_samples: self.debug_settings.ssao_sample_count,
+            tone_aces: self.debug_settings.tone_aces,
+            lod_distance_step: self.debug_settings.lod_distance_step,
+            bloom: self.debug_settings.bloom_enabled,
+            bloom_intensity: self.debug_settings.bloom_intensity,
+            bloom_threshold: self.debug_settings.bloom_threshold,
+            ibl_scale: self.debug_settings.ibl_scale,
+            master_volume: self.audio_ui.master_volume,
+            muted: self.audio_ui.muted,
+        };
+        if let Err(e) = save_config(&cfg) {
+            log::warn!("Could not save config: {e}");
+        }
+
+        // Auto-save session if the player is in a scene.
+        if self.app_screen == AppScreen::InScene {
+            if let Err(e) = self.save_session() {
+                log::warn!("Auto-save on exit failed: {e}");
+            } else {
+                log::info!("Session auto-saved to '{LAST_SESSION_PATH}'");
+            }
+        }
         if let Some(mut vulkan) = self.vulkan.take() {
             vulkan.destroy();
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Asset scanning helpers (Fase 35)
+// ---------------------------------------------------------------------------
+
+/// List files with a given extension in a directory.  Returns sorted paths.
+fn scan_dir_files(dir: &str, ext: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut files: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map(|x| x.to_str() == Some(ext)).unwrap_or(false))
+        .map(|e| e.path().to_string_lossy().into_owned())
+        .collect();
+    files.sort();
+    files
+}
+
+/// List scene names (filename stem) from `scenes/`, excluding hidden files.
+fn scan_saved_scenes() -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(SCENES_DIR) else { return Vec::new() };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let p = e.path();
+            p.extension().map(|x| x == "json").unwrap_or(false)
+                && !e.file_name().to_string_lossy().starts_with('.')
+        })
+        .filter_map(|e| {
+            e.path().file_stem().map(|s| s.to_string_lossy().into_owned())
+        })
+        .collect();
+    names.sort();
+    names
 }
 
 fn main() -> Result<()> {

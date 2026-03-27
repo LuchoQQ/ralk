@@ -7,8 +7,10 @@ pub struct InputState {
     pub left: bool,
     pub right: bool,
     pub sprint: bool,
-    /// Emergency brake (Space). Triggers skid sound at speed.
+    /// Emergency brake (Space — vehicles only, not used when on foot).
     pub brake: bool,
+    /// Jump request — set on key-press, consumed each physics tick.
+    pub jump: bool,
     /// Raw mouse delta accumulated since last `clear_frame_deltas()`.
     pub mouse_delta: Vec2,
     /// True when egui is consuming pointer/keyboard events — camera should not respond.
@@ -28,6 +30,7 @@ impl InputState {
             right: false,
             sprint: false,
             brake: false,
+            jump: false,
             mouse_delta: Vec2::ZERO,
             ui_captured: false,
             gamepad_move: Vec2::ZERO,

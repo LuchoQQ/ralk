@@ -1,0 +1,17 @@
+{
+  "msaa": 4,
+  "ssao": true,
+  "ssao_strength": 1.0,
+  "ssao_radius": 0.5,
+  "ssao_bias": 0.025,
+  "ssao_power": 2.0,
+  "ssao_samples": 32,
+  "tone_aces": false,
+  "lod_distance_step": 10.0,
+  "bloom": true,
+  "bloom_intensity": 0.65,
+  "bloom_threshold": 1.2,
+  "ibl_scale": 0.2,
+  "master_volume": 1.0,
+  "muted": false
+}
