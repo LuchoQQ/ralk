@@ -17,6 +17,9 @@ pub struct SceneFile {
     /// Point lights.
     #[serde(default)]
     pub point_lights: Vec<PointLightDef>,
+    /// Lua script paths to load when the scene starts (Fase 26).
+    #[serde(default)]
+    pub scripts: Vec<String>,
 }
 
 /// AudioSource parameters stored in scene.json.

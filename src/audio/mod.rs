@@ -126,6 +126,14 @@ impl AudioEngine {
         }
     }
 
+    /// Change the playback speed (and therefore pitch) of a tracked sink.
+    /// Values > 1.0 raise pitch; < 1.0 lower pitch.  Clamped to ≥ 0.01.
+    pub fn set_speed(&self, handle: SoundHandle, speed: f32) {
+        if let Some(Some((sink, _))) = self.sinks.get(handle.0) {
+            sink.set_speed(speed.max(0.01));
+        }
+    }
+
     pub fn set_master_volume(&mut self, volume: f32) {
         self.master_volume = volume.clamp(0.0, 1.0);
         self.reapply_all_volumes();
@@ -209,6 +217,74 @@ fn write_wav_sine(path: &str, frequency: f32, amplitude: f32, duration_secs: f32
     Ok(())
 }
 
+/// Write a looping WAV with a flat (non-decaying) envelope.
+fn write_wav_flat(path: &str, gen: impl Fn(f32) -> f32, duration_secs: f32) -> anyhow::Result<()> {
+    const SAMPLE_RATE: u32 = 22050;
+    let num_samples = (SAMPLE_RATE as f32 * duration_secs) as u32;
+    let data_size   = num_samples * 2;
+
+    let mut f = File::create(path)?;
+    f.write_all(b"RIFF")?;
+    f.write_all(&(36 + data_size).to_le_bytes())?;
+    f.write_all(b"WAVE")?;
+    f.write_all(b"fmt ")?;
+    f.write_all(&16u32.to_le_bytes())?;
+    f.write_all(&1u16.to_le_bytes())?;
+    f.write_all(&1u16.to_le_bytes())?;
+    f.write_all(&SAMPLE_RATE.to_le_bytes())?;
+    f.write_all(&(SAMPLE_RATE * 2).to_le_bytes())?;
+    f.write_all(&2u16.to_le_bytes())?;
+    f.write_all(&16u16.to_le_bytes())?;
+    f.write_all(b"data")?;
+    f.write_all(&data_size.to_le_bytes())?;
+    for i in 0..num_samples {
+        let t = i as f32 / SAMPLE_RATE as f32;
+        let sample = (gen(t).clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+        f.write_all(&sample.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+/// engine_loop.wav — sawtooth approximation (harmonics 1–6 at 120 Hz) for motor rumble.
+/// Flat envelope; pitch shifted at runtime via `set_speed()`.
+fn write_engine_loop(path: &str) -> anyhow::Result<()> {
+    let pi2 = std::f32::consts::TAU;
+    write_wav_flat(path, |t| {
+        // Sawtooth via partial sums of sine series: sin(k*ω*t)/k
+        let f0 = 120.0f32;
+        let s = (1..=6).map(|k| {
+            let k = k as f32;
+            f32::sin(pi2 * k * f0 * t) / k
+        }).sum::<f32>();
+        s * 0.35 // normalise amplitude
+    }, 1.0)
+}
+
+/// skid.wav — high-frequency buzz with amplitude modulation to simulate tire squeal.
+fn write_skid_loop(path: &str) -> anyhow::Result<()> {
+    let pi2 = std::f32::consts::TAU;
+    write_wav_flat(path, |t| {
+        // 850 Hz carrier, 45 Hz AM envelope → squealing tyre
+        let am  = 0.5 + 0.5 * f32::sin(pi2 * 45.0 * t);
+        let car = f32::sin(pi2 * 850.0 * t)
+                + f32::sin(pi2 * 1020.0 * t) * 0.4;
+        car * am * 0.4
+    }, 0.5)
+}
+
+/// wind_loop.wav — layered near-frequency sines for wind/turbulence whoosh.
+fn write_wind_loop(path: &str) -> anyhow::Result<()> {
+    let pi2 = std::f32::consts::TAU;
+    write_wav_flat(path, |t| {
+        // Beating pattern: 350, 420, 510, 580 Hz mixed → airy whoosh
+        let s = f32::sin(pi2 * 350.0 * t) * 0.25
+              + f32::sin(pi2 * 420.0 * t) * 0.20
+              + f32::sin(pi2 * 510.0 * t) * 0.15
+              + f32::sin(pi2 * 580.0 * t) * 0.10;
+        s
+    }, 2.0)
+}
+
 /// Ensure `assets/sounds/` contains placeholder WAV files for the engine samples.
 /// Only creates files that don't already exist.
 pub fn ensure_sample_sounds() {
@@ -253,5 +329,22 @@ pub fn ensure_sample_sounds() {
         write_wav_sine("assets/sounds/impact.wav", 180.0, 0.6, 0.25)
             .unwrap_or_else(|e| log::warn!("Could not create impact.wav: {e}"));
         log::info!("Created assets/sounds/impact.wav");
+    }
+
+    // Vehicle audio (Fase 30)
+    if !Path::new("assets/sounds/engine_loop.wav").exists() {
+        write_engine_loop("assets/sounds/engine_loop.wav")
+            .unwrap_or_else(|e| log::warn!("Could not create engine_loop.wav: {e}"));
+        log::info!("Created assets/sounds/engine_loop.wav");
+    }
+    if !Path::new("assets/sounds/skid.wav").exists() {
+        write_skid_loop("assets/sounds/skid.wav")
+            .unwrap_or_else(|e| log::warn!("Could not create skid.wav: {e}"));
+        log::info!("Created assets/sounds/skid.wav");
+    }
+    if !Path::new("assets/sounds/wind_loop.wav").exists() {
+        write_wind_loop("assets/sounds/wind_loop.wav")
+            .unwrap_or_else(|e| log::warn!("Could not create wind_loop.wav: {e}"));
+        log::info!("Created assets/sounds/wind_loop.wav");
     }
 }

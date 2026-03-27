@@ -1,5 +1,6 @@
 use anyhow::Result;
 use glam::{Mat4, Vec3};
+use std::sync::mpsc;
 
 use crate::engine::vertex::Vertex;
 
@@ -285,6 +286,10 @@ pub fn load_multi_glb(paths: &[String]) -> Result<(SceneData, Vec<usize>)> {
         log::info!("No models loaded from scene — using builtin cube");
         merged = builtin_cube();
         mesh_offsets = vec![0];
+    } else {
+        // Always append the builtin cube as the last mesh so cube_mesh_index is always valid.
+        let cube = builtin_cube();
+        merged.meshes.extend(cube.meshes);
     }
 
     Ok((merged, mesh_offsets))
@@ -339,5 +344,59 @@ pub fn builtin_cube() -> SceneData {
         }],
         textures: vec![],
         materials: vec![],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Async asset loader (Fase 25)
+// ---------------------------------------------------------------------------
+
+/// Non-blocking asset loader. Runs `load_multi_glb` on a background thread and
+/// delivers the result via a channel. The main thread polls each frame with
+/// `poll_complete()` and applies the result when it arrives.
+pub struct AssetLoader {
+    /// Active receiver; `None` when idle.
+    receiver: Option<mpsc::Receiver<Result<(SceneData, Vec<String>)>>>,
+}
+
+impl AssetLoader {
+    pub fn new() -> Self {
+        Self { receiver: None }
+    }
+
+    /// Returns `true` while a load is in flight.
+    pub fn is_loading(&self) -> bool {
+        self.receiver.is_some()
+    }
+
+    /// Kick off a background load of `models`. Ignored if already loading.
+    pub fn request_load(&mut self, models: Vec<String>) {
+        if self.is_loading() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.receiver = Some(rx);
+        std::thread::spawn(move || {
+            let result = load_multi_glb(&models).map(|(scene, _offsets)| (scene, models));
+            // Ignore send errors (receiver dropped if app exited during load).
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Non-blocking poll. Returns `Some` exactly once when the load completes,
+    /// then resets to idle. Returns `None` while still loading or when idle.
+    pub fn poll_complete(&mut self) -> Option<Result<(SceneData, Vec<String>)>> {
+        let rx = self.receiver.as_ref()?;
+        match rx.try_recv() {
+            Ok(result) => {
+                self.receiver = None;
+                Some(result)
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.receiver = None;
+                Some(Err(anyhow::anyhow!("Asset loader thread disconnected unexpectedly")))
+            }
+        }
     }
 }

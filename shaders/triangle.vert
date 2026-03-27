@@ -1,4 +1,4 @@
-#version 450
+#version 460
 
 layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec3 inNormal;
@@ -11,17 +11,44 @@ layout(location = 2) out vec3 fragT;      // tangent  (world space)
 layout(location = 3) out vec3 fragB;      // bitangent (world space)
 layout(location = 4) out vec3 fragN;      // normal   (world space)
 
-layout(push_constant) uniform PC {
-    mat4 mvp;    // bytes 0..64
-    mat4 model;  // bytes 64..128
-} pc;
+// Fase 23: model matrix comes from the instance SSBO (gl_BaseInstance).
+// view_proj is read from LightingUbo so vertex and compute share one source of truth.
+
+// Must match LightingUbo in Rust (std140, 304 bytes).
+layout(set = 0, binding = 0) uniform LightingUbo {
+    vec4 dir_light_dir;
+    vec4 dir_light_color;
+    vec4 point_light_pos;
+    vec4 point_light_color;
+    vec4 camera_pos;
+    mat4 light_mvp;
+    mat4 view_proj;
+    vec4 frustum_planes[6];
+} ubo;
+
+// Per-instance data — must match InstanceData in Rust (std430, 112 bytes).
+struct InstanceData {
+    mat4 model;
+    vec4 world_min;
+    vec4 world_max;
+    uint mesh_index;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+};
+
+layout(set = 0, binding = 5) readonly buffer InstanceBuffer {
+    InstanceData instances[];
+};
 
 void main() {
-    fragWorldPos = vec3(pc.model * vec4(inPosition, 1.0));
+    mat4 model = instances[gl_BaseInstance].model;
+
+    fragWorldPos = vec3(model * vec4(inPosition, 1.0));
     fragTexCoord = inTexCoord;
 
     // Normal matrix = transpose(inverse(mat3(model))) — correct for non-uniform scale.
-    mat3 normalMat = transpose(inverse(mat3(pc.model)));
+    mat3 normalMat = transpose(inverse(mat3(model)));
 
     vec3 N = normalize(normalMat * inNormal);
     vec3 T = normalize(normalMat * inTangent.xyz);
@@ -33,5 +60,5 @@ void main() {
     fragB = B;
     fragN = N;
 
-    gl_Position = pc.mvp * vec4(inPosition, 1.0);
+    gl_Position = ubo.view_proj * model * vec4(inPosition, 1.0);
 }

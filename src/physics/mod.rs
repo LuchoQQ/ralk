@@ -4,6 +4,8 @@ use glam::{Quat, Vec3};
 use rapier3d::na::UnitQuaternion;
 use rapier3d::prelude::*;
 
+pub use rapier3d::prelude::RigidBodyHandle;
+
 // ---------------------------------------------------------------------------
 // Contact event collector (Phase 17)
 // ---------------------------------------------------------------------------
@@ -182,6 +184,32 @@ impl PhysicsWorld {
             rb.set_next_kinematic_rotation(UnitQuaternion::from_quaternion(
                 rapier3d::na::Quaternion::new(rotation.w, rotation.x, rotation.y, rotation.z),
             ));
+        }
+    }
+
+    /// Spawn a kinematic capsule for the player character.
+    /// Capsule is upright (Y axis), half_height=0.5, radius=0.4 → 1.8 m tall.
+    /// Returns the body handle; no ECS entity is created for the player.
+    pub fn add_player_capsule(&mut self, position: Vec3) -> RigidBodyHandle {
+        let rb = RigidBodyBuilder::dynamic()
+            .translation(vector![position.x, position.y, position.z])
+            .locked_axes(LockedAxes::ROTATION_LOCKED)
+            .linear_damping(0.0)
+            .build();
+        let body_handle = self.rigid_bodies.insert(rb);
+        let collider = ColliderBuilder::capsule_y(0.5, 0.4)
+            .friction(0.0)
+            .restitution(0.0)
+            .build();
+        self.colliders.insert_with_parent(collider, body_handle, &mut self.rigid_bodies);
+        body_handle
+    }
+
+    /// Override the horizontal velocity of a body, keeping its current Y velocity.
+    pub fn set_horizontal_velocity(&mut self, handle: RigidBodyHandle, xz: Vec3) {
+        if let Some(rb) = self.rigid_bodies.get_mut(handle) {
+            let cur_y = rb.linvel().y;
+            rb.set_linvel(vector![xz.x, cur_y, xz.z], true);
         }
     }
 

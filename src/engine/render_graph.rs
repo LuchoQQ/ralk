@@ -207,6 +207,49 @@ impl ResourceAccess {
         }
     }
 
+    /// Depth image used as depth attachment in a pass, then transitioned to
+    /// SHADER_READ_ONLY_OPTIMAL so the next pass (SSAO) can sample it.
+    /// The enter barriers handle both cases:
+    ///   • image was in DEPTH_STENCIL (first SSAO frame) → no barrier needed
+    ///   • image was in SHADER_READ_ONLY (from last frame's SSAO) → barrier emitted
+    pub fn depth_attachment_to_shader_read() -> Self {
+        Self {
+            required_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            final_layout:    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            enter_src_stage:  vk::PipelineStageFlags::FRAGMENT_SHADER,
+            enter_dst_stage:  vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+            enter_src_access: vk::AccessFlags::SHADER_READ,
+            enter_dst_access: vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
+                | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            exit_src_stage:  vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+            exit_dst_stage:  vk::PipelineStageFlags::FRAGMENT_SHADER,
+            exit_src_access: vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            exit_dst_access: vk::AccessFlags::SHADER_READ,
+        }
+    }
+
+    /// Depth image used as depth attachment with no layout transition.
+    /// Used when SSAO is disabled — depth stays in DEPTH_STENCIL_ATTACHMENT_OPTIMAL.
+    /// The enter barrier handles the case where the image was left in SHADER_READ_ONLY
+    /// by the previous frame's SSAO pass.
+    pub fn depth_attachment() -> Self {
+        Self {
+            required_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            final_layout:    vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            enter_src_stage:  vk::PipelineStageFlags::FRAGMENT_SHADER,
+            enter_dst_stage:  vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+            enter_src_access: vk::AccessFlags::SHADER_READ,
+            enter_dst_access: vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
+                | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            exit_src_stage:  vk::PipelineStageFlags::empty(),
+            exit_dst_stage:  vk::PipelineStageFlags::empty(),
+            exit_src_access: vk::AccessFlags::empty(),
+            exit_dst_access: vk::AccessFlags::empty(),
+        }
+    }
+
     /// Swapchain image transitioning from COLOR_ATTACHMENT to PRESENT_SRC.
     /// Used for the final present pseudo-pass at frame end.
     pub fn present() -> Self {
@@ -225,6 +268,17 @@ impl ResourceAccess {
     }
 }
 
+/// A pipeline barrier for a VkBuffer between two passes.
+/// Declared alongside image accesses on the pass that needs the data to be ready.
+#[derive(Clone, Copy)]
+pub struct BufferBarrier {
+    pub buffer: vk::Buffer,
+    pub src_access: vk::AccessFlags,
+    pub dst_access: vk::AccessFlags,
+    pub src_stage: vk::PipelineStageFlags,
+    pub dst_stage: vk::PipelineStageFlags,
+}
+
 // ---------------------------------------------------------------------------
 // Internal state
 // ---------------------------------------------------------------------------
@@ -239,6 +293,8 @@ struct PassNode {
     name: &'static str,
     /// (resource index, access descriptor)
     accesses: Vec<(usize, ResourceAccess)>,
+    /// Buffer barriers emitted by begin_pass before this pass runs.
+    buffer_barriers: Vec<BufferBarrier>,
 }
 
 // ---------------------------------------------------------------------------
@@ -290,7 +346,29 @@ impl RenderGraph {
                 (id.0, *acc)
             })
             .collect();
-        self.passes.push(PassNode { name, accesses: resolved });
+        self.passes.push(PassNode { name, accesses: resolved, buffer_barriers: Vec::new() });
+    }
+
+    /// Declare a pass that also requires buffer memory barriers before it runs.
+    /// Buffer barriers are emitted by `begin_pass` alongside image barriers.
+    pub fn add_pass_with_buffers(
+        &mut self,
+        name: &'static str,
+        accesses: &[(ResourceId, ResourceAccess)],
+        buffer_barriers: &[BufferBarrier],
+    ) {
+        let resolved: Vec<(usize, ResourceAccess)> = accesses
+            .iter()
+            .map(|(id, acc)| {
+                debug_assert!(id.0 < self.images.len(), "ResourceId out of range for pass '{name}'");
+                (id.0, *acc)
+            })
+            .collect();
+        self.passes.push(PassNode {
+            name,
+            accesses: resolved,
+            buffer_barriers: buffer_barriers.to_vec(),
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -380,15 +458,38 @@ impl RenderGraph {
             dst_stage |= access.enter_dst_stage;
         }
 
-        if !barriers.is_empty() {
-            // SAFETY: cmd is recording; image barriers reference valid VkImage handles.
+        // Buffer barriers declared on this pass (e.g. compute write → indirect read).
+        let buf_barriers: Vec<vk::BufferMemoryBarrier> = pass
+            .buffer_barriers
+            .iter()
+            .map(|bb| {
+                vk::BufferMemoryBarrier::default()
+                    .src_access_mask(bb.src_access)
+                    .dst_access_mask(bb.dst_access)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(bb.buffer)
+                    .offset(0)
+                    .size(vk::WHOLE_SIZE)
+            })
+            .collect();
+
+        if !barriers.is_empty() || !buf_barriers.is_empty() {
+            // Merge stage masks from both image and buffer barriers.
+            let mut all_src = src_stage;
+            let mut all_dst = dst_stage;
+            for bb in &pass.buffer_barriers {
+                all_src |= bb.src_stage;
+                all_dst |= bb.dst_stage;
+            }
+            // SAFETY: cmd is recording; barriers reference valid Vulkan handles.
             unsafe {
                 device.cmd_pipeline_barrier(
                     cmd,
-                    src_stage,
-                    dst_stage,
+                    all_src,
+                    all_dst,
                     vk::DependencyFlags::empty(),
-                    &[], &[], &barriers,
+                    &[], &buf_barriers, &barriers,
                 );
             }
         }

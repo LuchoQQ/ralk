@@ -26,6 +26,19 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rapier3d = { version = "0.22", features = ["simd-stable"] }
 rodio = "0.19"
+meshopt = "0.3"
+mlua = { version = "0.10", features = ["lua54", "vendored"] }
 
 [build-dependencies]
 shaderc = "0.8"
+
+# ---------------------------------------------------------------------------
+# Examples
+# ---------------------------------------------------------------------------
+
+# The driving game is the same binary as `cargo run` — the engine and game
+# live together in src/main.rs.  The [[example]] entry lets users run it via
+# `cargo run --example driving_game` without any extra setup.
+[[example]]
+name = "driving_game"
+path = "src/main.rs"

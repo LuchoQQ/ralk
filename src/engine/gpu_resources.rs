@@ -20,11 +20,67 @@ pub struct BufferHandle(u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ImageHandle(u64);
 
-/// A mesh resident on the GPU: vertex + index buffers.
-pub struct GpuMesh {
-    pub vertex_buffer: BufferHandle,
-    pub index_buffer: BufferHandle,
+/// One LOD level of a mesh: offset + count into the mega index buffer.
+/// Shared vertex pool — vertex_offset is stored once in GpuMesh / GpuMeshInfo.
+#[derive(Clone, Copy)]
+pub struct GpuMeshLod {
+    pub first_index: u32,
     pub index_count: u32,
+}
+
+/// Mesh descriptor in the mega vertex/index buffer (Fase 23 GPU-driven rendering).
+/// Fase 24: extended to hold up to 4 LOD levels (indices only; vertices are shared).
+pub struct GpuMesh {
+    /// LOD levels in order: 0 = full detail, 1 = 50%, 2 = 25%, 3 = 12.5%.
+    pub lods:          [GpuMeshLod; 4],
+    /// Number of valid entries in `lods` (≥ 1).
+    pub lod_count:     u32,
+    /// Constant offset added to every index (same pool for all LODs).
+    pub vertex_offset: i32,
+}
+
+/// Per-instance GPU data written to the instance SSBO every frame.
+/// Matches the GLSL `InstanceData` struct in cull.comp / triangle.vert (std430, 112 bytes).
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct InstanceData {
+    pub model:      [[f32; 4]; 4],  // 64 bytes
+    pub world_min:  [f32; 4],       // 16 bytes — world-space AABB min (xyz, w unused)
+    pub world_max:  [f32; 4],       // 16 bytes — world-space AABB max (xyz, w unused)
+    pub mesh_index: u32,            //  4 bytes
+    pub _pad:       [u32; 3],       // 12 bytes
+}
+
+/// One LOD level in the GPU mesh-info SSBO. 8 bytes.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuMeshLodInfo {
+    pub first_index: u32,  // 4 bytes
+    pub index_count: u32,  // 4 bytes
+}
+
+/// Static per-mesh data in the mesh-info SSBO (uploaded once at scene load).
+/// Matches the GLSL `MeshInfo` struct in cull.comp (std430, 48 bytes).
+/// Fase 24: extended from 16 bytes to 48 bytes to hold 4 LOD levels.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuMeshInfo {
+    pub lods:          [GpuMeshLodInfo; 4],  // 32 bytes — 4 LOD levels
+    pub vertex_offset: i32,                  //  4 bytes, offset 32
+    pub lod_count:     u32,                  //  4 bytes, offset 36
+    pub _pad:          [u32; 2],             //  8 bytes — align to 16
+}  // 48 bytes total
+
+/// Matches `VkDrawIndexedIndirectCommand` exactly (20 bytes).
+/// Written by the cull compute shader; consumed by vkCmdDrawIndexedIndirect.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct DrawIndirectCommand {
+    pub index_count:    u32,
+    pub instance_count: u32,
+    pub first_index:    u32,
+    pub vertex_offset:  i32,
+    pub first_instance: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -317,30 +373,34 @@ impl GpuResourceManager {
     }
 
     // ---------------------------------------------------------------------------
-    // Mesh helpers
+    // Mega-buffer helpers (Fase 23 GPU-driven rendering)
     // ---------------------------------------------------------------------------
 
-    /// Upload vertices and indices to device-local buffers. Returns a `GpuMesh`.
-    pub fn upload_mesh(&mut self, vertices: &[Vertex], indices: &[u32]) -> Result<GpuMesh> {
-        let vertex_buffer = self.upload_to_device_local(
-            bytemuck::cast_slice(vertices),
+    /// Build the scene-wide mega vertex + index buffers from pre-concatenated data.
+    ///
+    /// All mesh geometry is packed into two device-local buffers.  Individual meshes are
+    /// addressed via `first_index` / `vertex_offset` stored in each `GpuMesh`.
+    pub fn build_mega_buffers(
+        &mut self,
+        all_vertices: &[Vertex],
+        all_indices:  &[u32],
+    ) -> Result<(BufferHandle, BufferHandle)> {
+        let vb = self.upload_to_device_local(
+            bytemuck::cast_slice(all_vertices),
             vk::BufferUsageFlags::VERTEX_BUFFER,
         )?;
-        let index_buffer = self.upload_to_device_local(
-            bytemuck::cast_slice(indices),
+        let ib = self.upload_to_device_local(
+            bytemuck::cast_slice(all_indices),
             vk::BufferUsageFlags::INDEX_BUFFER,
         )?;
-        Ok(GpuMesh {
-            vertex_buffer,
-            index_buffer,
-            index_count: indices.len() as u32,
-        })
-    }
-
-    /// Free the vertex and index buffers belonging to a mesh.
-    pub fn destroy_mesh(&mut self, mesh: GpuMesh) {
-        self.destroy_buffer(mesh.vertex_buffer);
-        self.destroy_buffer(mesh.index_buffer);
+        log::info!(
+            "Mega buffers built: {} vertices ({} KiB), {} indices ({} KiB)",
+            all_vertices.len(),
+            all_vertices.len() * std::mem::size_of::<Vertex>() / 1024,
+            all_indices.len(),
+            all_indices.len() * 4 / 1024,
+        );
+        Ok((vb, ib))
     }
 
     // ---------------------------------------------------------------------------
@@ -1111,6 +1171,54 @@ impl GpuResourceManager {
         let id = self.next_image_id;
         self.next_image_id += 1;
         self.images.insert(id, ImageEntry { image, image_view, allocation: Some(allocation) });
+
+        // Transition to the working layout once at creation so the render graph
+        // never needs to emit an UNDEFINED old_layout barrier on frame 1+.
+        // (Transitioning from UNDEFINED each frame confuses MoltenVK validation.)
+        let initial_layout = if aspect.contains(vk::ImageAspectFlags::DEPTH) {
+            vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+        } else {
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+        };
+        let dst_stage = if aspect.contains(vk::ImageAspectFlags::DEPTH) {
+            vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
+        } else {
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+        };
+        let dst_access = if aspect.contains(vk::ImageAspectFlags::DEPTH) {
+            vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
+        } else {
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+        };
+        self.execute_one_shot(|device, cmd| {
+            let barrier = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(dst_access)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(initial_layout)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: aspect,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            // SAFETY: cmd and device are valid for this one-shot buffer.
+            unsafe {
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    dst_stage,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier],
+                );
+            }
+        })?;
 
         log::debug!("MSAA image created ({width}×{height}, {format:?}, {samples:?})");
         Ok(ImageHandle(id))

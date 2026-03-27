@@ -1,0 +1,109 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+// Must match LightingUbo in Rust (std140 layout, 304 bytes).
+layout(set = 0, binding = 0) uniform LightingUbo {
+    vec4 dir_light_dir;
+    vec4 dir_light_color;
+    vec4 point_light_pos;
+    vec4 point_light_color;
+    vec4 camera_pos;       // xyz = world position
+    mat4 light_mvp;
+    mat4 view_proj;
+    vec4 frustum_planes[6];
+} ubo;
+
+// Must match InstanceData in Rust (112 bytes, std430).
+struct InstanceData {
+    mat4  model;
+    vec4  world_min;   // pre-transformed world-space AABB min (xyz, w unused)
+    vec4  world_max;   // pre-transformed world-space AABB max (xyz, w unused)
+    uint  mesh_index;
+    uint  _pad0;
+    uint  _pad1;
+    uint  _pad2;
+};
+
+// One LOD level: offset + count into the shared mega index buffer.
+struct LodLevel {
+    uint first_index;
+    uint index_count;
+};
+
+// Must match GpuMeshInfo in Rust (48 bytes, std430).
+// Fase 24: extended from 16 bytes to carry 4 LOD levels.
+struct MeshInfo {
+    LodLevel lods[4];    // 32 bytes — 4 LOD levels
+    int  vertex_offset;  //  4 bytes, offset 32
+    uint lod_count;      //  4 bytes, offset 36
+    uint _pad0;          //  4 bytes
+    uint _pad1;          //  4 bytes
+};
+
+// Must match VkDrawIndexedIndirectCommand (20 bytes).
+struct DrawCommand {
+    uint index_count;
+    uint instance_count;
+    uint first_index;
+    int  vertex_offset;
+    uint first_instance;
+};
+
+layout(set = 0, binding = 1) readonly buffer InstanceBuffer {
+    InstanceData instances[];
+};
+
+layout(set = 0, binding = 2) readonly buffer MeshInfoBuffer {
+    MeshInfo meshes[];
+};
+
+layout(set = 0, binding = 3) writeonly buffer DrawCommandBuffer {
+    DrawCommand commands[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint  instance_count;
+    float lod_distance_step;  // 0.0 = disable LOD (always use LOD 0)
+} pc;
+
+// Returns true when the world-space AABB [mn, mx] is inside (or overlapping) the frustum.
+// Uses the p-vertex (most-positive-corner) test.
+bool aabb_visible(vec3 mn, vec3 mx) {
+    for (int i = 0; i < 6; i++) {
+        vec3 n = ubo.frustum_planes[i].xyz;
+        float d = ubo.frustum_planes[i].w;
+        vec3 p = mix(mn, mx, greaterThanEqual(n, vec3(0.0)));
+        if (dot(n, p) + d < 0.0) return false;
+    }
+    return true;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.instance_count) return;
+
+    InstanceData inst = instances[idx];
+    MeshInfo     mesh = meshes[inst.mesh_index];
+    bool visible = aabb_visible(inst.world_min.xyz, inst.world_max.xyz);
+
+    // --- LOD selection ---
+    // Compute distance from camera to AABB centre.
+    vec3  centre = (inst.world_min.xyz + inst.world_max.xyz) * 0.5;
+    float dist   = distance(ubo.camera_pos.xyz, centre);
+
+    uint lod = 0u;
+    if (pc.lod_distance_step > 0.0) {
+        lod = min(uint(dist / pc.lod_distance_step), mesh.lod_count - 1u);
+    }
+
+    LodLevel lvl = mesh.lods[lod];
+
+    DrawCommand cmd;
+    cmd.index_count    = lvl.index_count;
+    cmd.instance_count = visible ? 1u : 0u;
+    cmd.first_index    = lvl.first_index;
+    cmd.vertex_offset  = mesh.vertex_offset;
+    cmd.first_instance = idx;
+    commands[idx]      = cmd;
+}

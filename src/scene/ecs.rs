@@ -97,6 +97,78 @@ pub struct AudioSource {
     pub handle: Option<SoundHandle>,
 }
 
+// ---------------------------------------------------------------------------
+// Vehicle (Fase 30 — audio simulation; full physics in Fase 27)
+// ---------------------------------------------------------------------------
+
+/// A vehicle whose audio reacts to simulated RPM, speed, braking, and collisions.
+///
+/// Fase 30 provides the audio layer; Fase 27 will replace the simple speed/RPM
+/// simulation here with proper raycast-suspension physics.
+pub struct Vehicle {
+    // --- Simulation state ---
+    /// Forward speed in m/s (0..max_speed).
+    pub current_speed: f32,
+    /// Simulated engine RPM (0..max_rpm).
+    pub current_rpm: f32,
+    /// Maximum RPM (default 7 000).
+    pub max_rpm: f32,
+    /// Top speed in m/s (default 30 m/s ≈ 108 km/h).
+    pub max_speed: f32,
+    /// Throttle input written by the input system each frame (0..1).
+    pub acceleration_input: f32,
+    /// Brake input (0..1).  > 0.3 at speed triggers tyre squeal.
+    pub brake_input: f32,
+    /// True when the vehicle is sliding (skid sound active).
+    pub is_skidding: bool,
+
+    // --- Audio sink handles (None = not yet started) ---
+    pub engine_handle: Option<SoundHandle>,
+    pub skid_handle:   Option<SoundHandle>,
+    pub wind_handle:   Option<SoundHandle>,
+}
+
+impl Default for Vehicle {
+    fn default() -> Self {
+        Self {
+            current_speed: 0.0,
+            current_rpm:   800.0,
+            max_rpm:        7_000.0,
+            max_speed:      30.0,
+            acceleration_input: 0.0,
+            brake_input:    0.0,
+            is_skidding:    false,
+            engine_handle:  None,
+            skid_handle:    None,
+            wind_handle:    None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Game logic (Fase 31)
+// ---------------------------------------------------------------------------
+
+/// A trigger zone that marks a lap checkpoint.  The game system advances
+/// `next_checkpoint` when the vehicle position is within `trigger_radius` of
+/// this entity's Transform.
+pub struct Checkpoint {
+    /// Sequential index (0-based). The finish line is the highest index.
+    pub index:          u32,
+    /// When true, crossing this checkpoint while all others are done = lap complete.
+    pub is_finish_line: bool,
+    /// Sphere trigger radius in world units.
+    pub trigger_radius: f32,
+}
+
+/// Marks a PointLight as a street/circuit lamp that turns on automatically at night.
+/// The day/night system sets `PointLight::intensity` to `base_intensity` during night
+/// (time_of_day in 0.35..0.65) and 0.0 during the day.
+pub struct StreetLight {
+    /// Intensity when the light is on (night-time).
+    pub base_intensity: f32,
+}
+
 /// Links an ECS entity to a rapier3d collider (stores shape info for wireframe).
 pub struct PhysicsCollider {
     #[allow(dead_code)]

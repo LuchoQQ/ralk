@@ -19,6 +19,7 @@ fn main() {
         let kind = match path.extension().and_then(|e| e.to_str()) {
             Some("vert") => shaderc::ShaderKind::Vertex,
             Some("frag") => shaderc::ShaderKind::Fragment,
+            Some("comp") => shaderc::ShaderKind::Compute,
             _ => continue,
         };
 

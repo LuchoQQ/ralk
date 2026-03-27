@@ -16,29 +16,52 @@ mod engine;
 mod input;
 mod physics;
 mod scene;
+mod scripting;
 mod ui;
 
 use asset::{
-    AudioSourceDef, ColliderDef, DirLightDef, EntityDef, PointLightDef, RigidBodyDef, SceneData,
-    SceneFile, ShaderCompiler, load_multi_glb, load_scene_file, save_scene_file,
+    AssetLoader, AudioSourceDef, ColliderDef, DirLightDef, EntityDef, PointLightDef,
+    RigidBodyDef, SceneData, SceneFile, ShaderCompiler, load_multi_glb, load_scene_file,
+    save_scene_file,
 };
 use audio::{AudioEngine, ensure_sample_sounds};
-use physics::PhysicsWorld;
+use physics::{PhysicsWorld, RigidBodyHandle};
 use ash::vk;
-use engine::VulkanContext;
+use engine::{DrawInstance, VulkanContext};
 use input::InputState;
 use scene::{
-    AudioSource, BoundingBox, Camera3D, ColliderShapeType, DirectionalLight, LightingUbo,
-    MeshRenderer, PhysicsBody, PhysicsBodyType, PhysicsCollider, PointLight, Transform,
-    compute_light_mvp, extract_frustum_planes, is_aabb_visible, transform_aabb,
+    AudioSource, BoundingBox, Camera3D, ColliderShapeType, DirectionalLight, EYE_OFFSET,
+    LightingUbo, MeshRenderer, PhysicsBody, PhysicsBodyType, PhysicsCollider, PointLight,
+    PLAYER_SPAWN_Y, StreetLight, Transform, Vehicle, compute_light_mvp, extract_frustum_planes,
+    transform_aabb,
     // Phase 20 additions:
     GizmoAxis, GizmoDrag, GizmoMode,
     build_axis_groups, build_selection_group, drag_axis_dir,
     hit_test_gizmo, ray_aabb, screen_to_ray,
 };
-use ui::{AudioUiState, DebugSettings, DebugUi, EditorUiState, FrameStats, PhysicsUiState, SceneUiState};
+use scripting::{ScriptCommand, ScriptEngine};
+use ui::{AudioUiState, DayNightUiState, DebugSettings, DebugUi, EditorUiState, FrameStats,
+         GameAction, GameHudState, GameStateKind, PhysicsUiState, SceneUiState,
+         ScriptingUiState, VehicleAudioUiState};
 
 const TICK_RATE: f32 = 1.0 / 60.0;
+
+// ---------------------------------------------------------------------------
+// Game logic types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GameState {
+    Exploring,
+    Paused,
+}
+
+/// Runtime session state for the exploration sandbox.
+struct GameSession {
+    state:          GameState,
+    /// Set when the player clicks Quit from the pause overlay → exit the app.
+    exit_requested: bool,
+}
 const GAMEPAD_DEAD_ZONE: f32 = 0.15;
 const SCENE_PATH: &str = "scene.json";
 
@@ -69,6 +92,10 @@ struct App {
     physics_ui: PhysicsUiState,
     audio_engine: Option<AudioEngine>,
     audio_ui: AudioUiState,
+    /// Async glTF loader: parses + decodes on a background thread (Fase 25).
+    asset_loader: AssetLoader,
+    /// Scene file saved at `request_load` time; consumed by `apply_loaded_scene`.
+    pending_scene_file: Option<SceneFile>,
     /// Index of the builtin cube mesh (always the last mesh in scene_data after a load).
     cube_mesh_index: usize,
     // Phase 20: gizmo / object picking
@@ -80,6 +107,17 @@ struct App {
     pending_pick: bool,
     window_size: (u32, u32),
     editor_ui: EditorUiState,
+    /// Lua scripting engine (Fase 26).
+    script_engine: Option<ScriptEngine>,
+    scripting_ui: ScriptingUiState,
+    /// Day/Night cycle state (Fase 29). Also drives the egui panel directly.
+    day_night_ui: DayNightUiState,
+    /// Vehicle audio channel volumes (Fase 30).
+    vehicle_audio_ui: VehicleAudioUiState,
+    game: GameSession,
+    game_hud: GameHudState,
+    /// Physics body for the player capsule. Set in `resumed()`, used every tick.
+    player_body: Option<RigidBodyHandle>,
 }
 
 impl App {
@@ -95,22 +133,24 @@ impl App {
         let gilrs = gilrs::Gilrs::new()
             .map_err(|e| log::warn!("Gamepad support disabled: {e}"))
             .ok();
+        let script_engine = ScriptEngine::new()
+            .map_err(|e| log::warn!("Scripting disabled: {e}"))
+            .ok();
         if let Some(ref g) = gilrs {
             for (_id, gamepad) in g.gamepads() {
                 log::info!("Gamepad connected: {}", gamepad.name());
             }
         }
 
-        let mut physics = PhysicsWorld::new();
-
-        // Static floor: large flat box at y = -1.0 (centered below origin).
-        physics.add_static_box(Vec3::new(0.0, -1.0, 0.0), Vec3::new(20.0, 0.5, 20.0), 0.5, 0.8);
+        let physics = PhysicsWorld::new();
 
         Self {
             window: None,
             vulkan: None,
             scene_data,
             model_paths,
+            asset_loader: AssetLoader::new(),
+            pending_scene_file: None,
             cube_mesh_index,
             camera: Camera3D::new(1280.0 / 720.0),
             world: hecs::World::new(),
@@ -128,13 +168,25 @@ impl App {
             last_fps: 0.0,
             last_drawn: 0,
             last_total: 0,
-            debug_settings: DebugSettings { tone_aces: false, msaa_samples: 4, msaa_max: 4 },
+            debug_settings: DebugSettings {
+                tone_aces: false,
+                msaa_samples: 4,
+                msaa_max: 4,
+                ssao_enabled: true,
+                ssao_radius: 0.5,
+                ssao_bias: 0.025,
+                ssao_power: 2.0,
+                ssao_strength: 1.0,
+                ssao_sample_count: 32,
+                lod_distance_step: 10.0,
+            },
             scene_ui: SceneUiState {
                 save_clicked: false,
                 load_clicked: false,
                 status: String::new(),
                 model_count: 0,
                 entity_count: 0,
+                is_loading: false,
             },
             physics_ui: PhysicsUiState {
                 spawn_cube_clicked: false,
@@ -157,6 +209,34 @@ impl App {
                 gizmo_mode: 0,
                 transform_changed: false,
             },
+            script_engine,
+            scripting_ui: ScriptingUiState {
+                scripts: Vec::new(),
+                log_lines: Vec::new(),
+            },
+            day_night_ui: DayNightUiState {
+                time_of_day: 0.0,
+                auto_cycle: true,
+                cycle_duration: 180.0, // 3 minutes
+            },
+            vehicle_audio_ui: VehicleAudioUiState {
+                engine_volume:  0.6,
+                skid_volume:    0.7,
+                wind_volume:    0.5,
+                effects_volume: 0.8,
+            },
+            game: GameSession {
+                state:          GameState::Exploring,
+                exit_requested: false,
+            },
+            game_hud: GameHudState {
+                kind:      GameStateKind::Exploring,
+                speed_kmh: 0.0,
+                rpm:       800.0,
+                max_rpm:   7000.0,
+                action:    GameAction::default(),
+            },
+            player_body: None,
         }
     }
 
@@ -304,37 +384,152 @@ impl App {
         ));
     }
 
-    /// Fallback: spawn entities directly from `scene_data` (no scene.json).
-    /// Mirrors the old M2 behavior: 3 copies of each mesh at X offsets.
-    fn spawn_scene_default(&mut self) {
-        let default_mat_idx = self.scene_data.materials.len();
+    /// Fallback: build the open-world exploration sandbox.
+    ///
+    /// Layout (top-down, Y = up):
+    /// - Ground plane: 40 × 40 m flat static box
+    /// - 4 boundary walls (N/S/E/W), 1 m thick, 2 m tall
+    /// - 4 corner pillars (1 × 4 × 1) for visual landmarks
+    /// - 6 static obstacle blocks scattered mid-arena
+    /// - 11 dynamic physics cubes (8 scattered + 3-cube tower)
+    /// - Model instances at varied positions if any GLB was loaded
+    /// - 1 directional light + 2 point lights for atmosphere
+    fn spawn_sandbox_scene(&mut self) {
+        let cube = self.cube_mesh_index;
+        let default_mat = self.scene_data.materials.len();
 
-        for x_offset in [-3.0f32, 0.0, 3.0] {
-            let translation = glam::Mat4::from_translation(Vec3::new(x_offset, 0.0, 0.0));
-            for (mesh_idx, mesh_data) in self.scene_data.meshes.iter().enumerate() {
-                let mat_set_idx = mesh_data.material_index.unwrap_or(default_mat_idx);
+        // ---- helpers -------------------------------------------------------
+        let spawn_static = |physics: &mut PhysicsWorld,
+                            world: &mut hecs::World,
+                            pos: Vec3, half: Vec3| {
+            let (bh, ch) = physics.add_static_box(pos, half, 0.4, 0.7);
+            // BoundingBox is in mesh-local space (unit cube = ±0.5); scale handles the rest.
+            let mesh_bbox = Vec3::splat(0.5);
+            world.spawn((
+                Transform { position: pos, rotation: Quat::IDENTITY, scale: half * 2.0 },
+                MeshRenderer { mesh_index: cube, material_set_index: default_mat },
+                BoundingBox { min: -mesh_bbox, max: mesh_bbox },
+                PhysicsBody { handle: bh, body_type: PhysicsBodyType::Static },
+                PhysicsCollider { handle: ch, shape: ColliderShapeType::Box, half_extents: half },
+            ));
+        };
+
+        let spawn_dynamic = |physics: &mut PhysicsWorld,
+                             world: &mut hecs::World,
+                             pos: Vec3, half: Vec3| {
+            let (bh, ch) = physics.add_dynamic_box(pos, half, 0.5, 0.5);
+            let mesh_bbox = Vec3::splat(0.5);
+            world.spawn((
+                Transform { position: pos, rotation: Quat::IDENTITY, scale: half * 2.0 },
+                MeshRenderer { mesh_index: cube, material_set_index: default_mat },
+                BoundingBox { min: -mesh_bbox, max: mesh_bbox },
+                PhysicsBody { handle: bh, body_type: PhysicsBodyType::Dynamic },
+                PhysicsCollider { handle: ch, shape: ColliderShapeType::Box, half_extents: half },
+            ));
+        };
+
+        // ---- ground --------------------------------------------------------
+        // Large flat slab: 40 × 0.5 × 40, top surface at y = 0
+        spawn_static(&mut self.physics, &mut self.world,
+            Vec3::new(0.0, -0.25, 0.0), Vec3::new(20.0, 0.25, 20.0));
+
+        // ---- boundary walls ------------------------------------------------
+        let wall_h = Vec3::new(20.0, 1.0, 0.5);   // N/S walls (full width)
+        let wall_v = Vec3::new(0.5, 1.0, 20.0);   // E/W walls (full depth)
+        spawn_static(&mut self.physics, &mut self.world, Vec3::new( 0.0, 1.0,  20.0), wall_h);  // N
+        spawn_static(&mut self.physics, &mut self.world, Vec3::new( 0.0, 1.0, -20.0), wall_h);  // S
+        spawn_static(&mut self.physics, &mut self.world, Vec3::new( 20.0, 1.0, 0.0),  wall_v);  // E
+        spawn_static(&mut self.physics, &mut self.world, Vec3::new(-20.0, 1.0, 0.0),  wall_v);  // W
+
+        // ---- corner pillars ------------------------------------------------
+        let pillar = Vec3::new(0.5, 2.0, 0.5);
+        for &(px, pz) in &[(19.0f32, 19.0f32), (-19.0, 19.0), (19.0, -19.0), (-19.0, -19.0)] {
+            spawn_static(&mut self.physics, &mut self.world, Vec3::new(px, 2.0, pz), pillar);
+        }
+
+        // ---- static obstacles ----------------------------------------------
+        // Assorted blocks placed to break up line-of-sight and create interest
+        let obstacles: &[(Vec3, Vec3)] = &[
+            (Vec3::new( 5.0, 0.75,  5.0), Vec3::new(1.0, 0.75, 1.0)),
+            (Vec3::new(-6.0, 0.5,   3.0), Vec3::new(1.5, 0.5,  0.5)),
+            (Vec3::new( 8.0, 1.0,  -4.0), Vec3::new(0.5, 1.0,  2.0)),
+            (Vec3::new(-3.0, 0.75, -8.0), Vec3::new(2.0, 0.75, 0.5)),
+            (Vec3::new( 0.0, 0.5,  12.0), Vec3::new(3.0, 0.5,  0.5)),
+            (Vec3::new(-10.0, 1.5, -5.0), Vec3::new(0.5, 1.5,  0.5)),
+        ];
+        for &(pos, half) in obstacles {
+            spawn_static(&mut self.physics, &mut self.world, pos, half);
+        }
+
+        // ---- dynamic props (scattered cubes) -------------------------------
+        let props: &[Vec3] = &[
+            Vec3::new( 3.0, 0.5,  3.0),
+            Vec3::new(-4.0, 0.5,  6.0),
+            Vec3::new( 6.0, 0.5, -2.0),
+            Vec3::new(-2.0, 0.5, -6.0),
+            Vec3::new( 9.0, 0.5,  7.0),
+            Vec3::new(-7.0, 0.5, -9.0),
+            Vec3::new( 4.0, 0.5, -12.0),
+            Vec3::new(-11.0, 0.5, 4.0),
+        ];
+        let half_cube = Vec3::splat(0.5);
+        for &pos in props {
+            spawn_dynamic(&mut self.physics, &mut self.world, pos, half_cube);
+        }
+
+        // 3-cube tower at (−5, y, −3)
+        spawn_dynamic(&mut self.physics, &mut self.world, Vec3::new(-5.0, 0.5,  -3.0), half_cube);
+        spawn_dynamic(&mut self.physics, &mut self.world, Vec3::new(-5.0, 1.5,  -3.0), half_cube);
+        spawn_dynamic(&mut self.physics, &mut self.world, Vec3::new(-5.0, 2.5,  -3.0), half_cube);
+
+        // ---- model instances (dynamic physics) --------------------------------
+        // Use all non-cube meshes (the cube is always last after our append).
+        let model_count = self.scene_data.meshes.len().saturating_sub(1); // exclude the appended cube
+        if model_count > 0 {
+            let positions = [
+                Vec3::new( 2.0, 1.5,  2.0),
+                Vec3::new(-3.0, 1.5, -3.0),
+                Vec3::new( 5.0, 1.5, -1.0),
+            ];
+            for (i, &pos) in positions.iter().enumerate() {
+                let mesh_idx = i % model_count;
+                let mesh_data = &self.scene_data.meshes[mesh_idx];
+                let mat_idx = mesh_data.material_index.unwrap_or(default_mat);
+
+                // Compute a box half-extents from the mesh's local AABB + its own transform.
+                let (wmin, wmax) = transform_aabb(mesh_data.aabb_min, mesh_data.aabb_max, mesh_data.transform);
+                let half = ((wmax - wmin) * 0.5).max(Vec3::splat(0.05));
+
+                let (bh, ch) = self.physics.add_dynamic_box(pos, half, 0.3, 0.5);
+                let translation = glam::Mat4::from_translation(pos);
                 let transform = Transform::from_matrix(translation * mesh_data.transform);
-                let bbox = BoundingBox { min: mesh_data.aabb_min, max: mesh_data.aabb_max };
+                let mesh_bbox = Vec3::splat(0.5);
                 self.world.spawn((
                     transform,
-                    MeshRenderer { mesh_index: mesh_idx, material_set_index: mat_set_idx },
-                    bbox,
+                    MeshRenderer { mesh_index: mesh_idx, material_set_index: mat_idx },
+                    BoundingBox { min: -mesh_bbox, max: mesh_bbox },
+                    PhysicsBody { handle: bh, body_type: PhysicsBodyType::Dynamic },
+                    PhysicsCollider { handle: ch, shape: ColliderShapeType::Box, half_extents: half },
                 ));
             }
         }
 
+        // ---- lights --------------------------------------------------------
         self.world.spawn((
             Transform::from_position(Vec3::ZERO),
             DirectionalLight {
                 direction: Vec3::new(0.4, -1.0, -0.6).normalize(),
                 color: Vec3::ONE,
-                intensity: 1.2,
+                intensity: 1.5,
             },
         ));
-
         self.world.spawn((
-            Transform::from_position(Vec3::new(2.0, 2.0, 2.0)),
-            PointLight { color: Vec3::new(1.0, 0.9, 0.7), intensity: 3.0, radius: 10.0 },
+            Transform::from_position(Vec3::new(8.0, 4.0, 8.0)),
+            PointLight { color: Vec3::new(1.0, 0.9, 0.7), intensity: 6.0, radius: 20.0 },
+        ));
+        self.world.spawn((
+            Transform::from_position(Vec3::new(-8.0, 4.0, -8.0)),
+            PointLight { color: Vec3::new(0.7, 0.8, 1.0), intensity: 4.0, radius: 20.0 },
         ));
     }
 
@@ -396,56 +591,71 @@ impl App {
             });
         }
 
+        let scripts = self.script_engine.as_ref()
+            .map(|se| se.scripts.iter().map(|s| s.path.clone()).collect())
+            .unwrap_or_default();
         let sf = SceneFile {
             models: self.model_paths.clone(),
             entities,
             directional_light: dir_light,
             point_lights,
+            scripts,
         };
         save_scene_file(SCENE_PATH, &sf)
     }
 
-    /// Load `scene.json`, reload GPU resources, and respawn the ECS world.
+    /// Kick off an async load of `scene.json`. Returns immediately; the main loop
+    /// polls `asset_loader.poll_complete()` each frame and calls `apply_loaded_scene`.
     fn load_scene(&mut self) -> Result<()> {
         let sf = load_scene_file(SCENE_PATH)?;
-        let (new_scene, _offsets) = load_multi_glb(&sf.models)?;
+        // Store the scene file so we can respawn entities when the load finishes.
+        self.pending_scene_file = Some(sf.clone());
+        self.asset_loader.request_load(sf.models);
+        self.scene_ui.status = "Loading...".into();
+        Ok(())
+    }
 
+    /// Apply a completed async load: upload GPU resources and rebuild the ECS world.
+    /// Called by the main loop when `asset_loader.poll_complete()` returns `Some`.
+    fn apply_loaded_scene(&mut self, new_scene: SceneData, models: Vec<String>) -> Result<()> {
         if let Some(ref mut vulkan) = self.vulkan {
             vulkan.reload_scene(&new_scene)?;
         }
 
         self.world = hecs::World::new();
         self.physics = PhysicsWorld::new();
-        // Restore the static floor after physics reset.
-        self.physics.add_static_box(Vec3::new(0.0, -1.0, 0.0), Vec3::new(20.0, 0.5, 20.0), 0.5, 0.8);
-
         self.cube_mesh_index = new_scene.meshes.len().saturating_sub(1);
-        self.model_paths = sf.models.clone();
+        self.model_paths = models;
         self.scene_data = new_scene;
-        self.spawn_from_scene_file(&sf);
 
-        log::info!(
-            "Loaded scene: {} models, {} entities",
-            sf.models.len(),
-            sf.entities.len(),
-        );
+        if let Some(sf) = self.pending_scene_file.take() {
+            self.spawn_from_scene_file(&sf);
+            log::info!(
+                "Scene applied: {} models, {} entities",
+                self.model_paths.len(),
+                sf.entities.len(),
+            );
+            if let Some(ref mut se) = self.script_engine {
+                se.reload_scripts(&sf.scripts);
+            }
+        } else {
+            self.spawn_sandbox_scene();
+        }
         Ok(())
     }
 
-    /// Spawn a physics cube in front of the camera.
-    fn spawn_physics_cube(&mut self) {
-        let spawn_pos = self.camera.position + self.camera.forward() * 3.0 + Vec3::Y * 1.0;
+    /// Spawn a physics cube at an arbitrary world-space position.
+    fn spawn_physics_cube_at(&mut self, spawn_pos: Vec3) {
         let half_extents = Vec3::splat(0.5);
         let (body_handle, collider_handle) =
             self.physics.add_dynamic_box(spawn_pos, half_extents, 0.4, 0.5);
-
         let transform = Transform::from_position(spawn_pos);
         let bbox = BoundingBox { min: -half_extents, max: half_extents };
         self.world.spawn((
             transform,
             MeshRenderer {
                 mesh_index: self.cube_mesh_index,
-                material_set_index: self.scene_data.materials.len(), // default material
+                material_set_index: self.scene_data.materials.len(),
             },
             bbox,
             PhysicsBody { handle: body_handle, body_type: PhysicsBodyType::Dynamic },
@@ -455,6 +665,12 @@ impl App {
                 half_extents,
             },
         ));
+    }
+
+    /// Spawn a physics cube in front of the camera (UI button).
+    fn spawn_physics_cube(&mut self) {
+        let spawn_pos = self.camera.position + self.camera.forward() * 3.0 + Vec3::Y * 1.0;
+        self.spawn_physics_cube_at(spawn_pos);
         log::info!("Spawned physics cube at {:?}", spawn_pos);
     }
 
@@ -499,7 +715,7 @@ impl App {
         lines
     }
 
-    fn build_lighting_ubo(&self) -> LightingUbo {
+    fn build_lighting_ubo(&self, view_proj: glam::Mat4) -> LightingUbo {
         let mut dir_dir = Vec3::new(0.4, -1.0, -0.6).normalize();
         let mut dir_color = Vec3::ONE;
         let mut dir_intensity = 1.2f32;
@@ -520,6 +736,7 @@ impl App {
 
         let light_view_proj = compute_light_mvp(dir_dir);
         let tone_mode = if self.debug_settings.tone_aces { 1.0_f32 } else { 0.0_f32 };
+        let frustum = extract_frustum_planes(view_proj);
         LightingUbo {
             dir_light_dir:     dir_dir.extend(0.0).into(),
             dir_light_color:   Vec4::from((dir_color, dir_intensity)).into(),
@@ -527,30 +744,211 @@ impl App {
             point_light_color: Vec4::from((pt_color, pt_intensity)).into(),
             camera_pos:        self.camera.position.extend(tone_mode).into(),
             light_mvp:         light_view_proj.to_cols_array(),
+            view_proj:         view_proj.to_cols_array(),
+            frustum_planes:    frustum.map(|p| p.into()),
         }
     }
 
-    fn build_draw_list(
-        &mut self,
-        view_proj: glam::Mat4,
-    ) -> (Vec<(glam::Mat4, usize, usize)>, usize, usize) {
-        let planes = extract_frustum_planes(view_proj);
+    /// Advance and apply the day/night cycle.
+    ///
+    /// Reads/writes `self.day_night_ui`, then mutates ECS DirectionalLight and StreetLight
+    /// PointLights so that `build_lighting_ubo` picks up the new values automatically.
+    /// Returns the sky tint to pass to `draw_frame`.
+    fn update_day_night(&mut self, dt: f32) -> [f32; 4] {
+        // Advance time.
+        if self.day_night_ui.auto_cycle {
+            self.day_night_ui.time_of_day =
+                (self.day_night_ui.time_of_day + dt / self.day_night_ui.cycle_duration).fract();
+        }
+        let t = self.day_night_ui.time_of_day;
+
+        // --- Sun direction: rotates east→west across the sky ---
+        // angle=0 at noon (sun above), angle=π at midnight (sun below horizon).
+        let angle = std::f32::consts::TAU * t;
+        let sun_dir = glam::Vec3::new(angle.sin() * 0.6, -angle.cos(), 0.3).normalize();
+
+        // --- Sun color/intensity from keyframes ---
+        let (sun_color, sun_intensity) = sample_sun_keyframe(t);
+
+        // --- Update ECS DirectionalLight ---
+        for (_, light) in self.world.query::<&mut DirectionalLight>().iter() {
+            light.direction = sun_dir;
+            light.color     = sun_color;
+            light.intensity = sun_intensity;
+        }
+
+        // --- Street lights: on during night (0.35 < t < 0.65), off during day ---
+        let is_night = t > 0.35 && t < 0.65;
+        for (_, (light, street)) in
+            self.world.query::<(&mut PointLight, &StreetLight)>().iter()
+        {
+            if is_night {
+                light.intensity = street.base_intensity;
+                light.color     = glam::Vec3::new(1.0, 0.9, 0.5); // warm amber street light
+            } else {
+                light.intensity = 0.0;
+            }
+        }
+
+        // --- Sky tint from keyframes ---
+        sample_sky_tint(t)
+    }
+
+    /// Update the vehicle simulation and all vehicle-audio channels.
+    ///
+    /// Input mapping (when mouse captured):
+    /// - W → throttle,  S → brake,  Space → emergency brake (guaranteed skid at speed)
+    ///
+    /// Audio channels:
+    /// - **engine**: looping sawtooth, pitch = `BASE + (rpm/max_rpm) * RANGE`
+    /// - **wind**:   looping whoosh, volume = `(speed/max_speed).clamp(0, 0.8)`
+    /// - **skid**:   looping squeal, started when `brake > 0.3 && speed > 4`, stopped otherwise
+    ///
+    /// Collision impacts are handled by the physics system (see `all_impacts` in the render loop).
+    fn update_vehicle_audio(&mut self, dt: f32) {
+        const IDLE_RPM:          f32 = 800.0;
+        const ENGINE_BASE_PITCH: f32 = 0.4;   // speed multiplier at idle
+        const ENGINE_PITCH_RANGE:f32 = 1.6;   // additional multiplier at max RPM → 2.0× total
+
+        let can_drive = self.game.state == GameState::Exploring;
+        let accel_input = if can_drive && self.input.forward && !self.input.ui_captured { 1.0f32 } else { 0.0 };
+        let brake_input = if can_drive && (self.input.backward || self.input.brake) && !self.input.ui_captured {
+            if self.input.brake { 1.0 } else { 0.6 }  // Space = full skid, S = partial
+        } else { 0.0 };
+
+        let engine_vol  = self.vehicle_audio_ui.engine_volume;
+        let skid_vol    = self.vehicle_audio_ui.skid_volume;
+        let wind_vol    = self.vehicle_audio_ui.wind_volume;
+
+        // Borrow audio engine and the world simultaneously (disjoint fields).
+        if let Some(ref mut audio) = self.audio_engine {
+            for (_, veh) in self.world.query::<&mut Vehicle>().iter() {
+                // --- Simulate RPM ---
+                veh.acceleration_input = accel_input;
+                veh.brake_input        = brake_input;
+
+                let rpm_target = if accel_input > 0.0 {
+                    IDLE_RPM + (veh.max_rpm - IDLE_RPM) * accel_input
+                } else if brake_input > 0.0 {
+                    (veh.current_rpm * 0.35).max(IDLE_RPM * 0.4)
+                } else {
+                    IDLE_RPM
+                };
+                // Lerp RPM: rise fast (3 s⁻¹), fall slower (2 s⁻¹)
+                let rpm_rate = if rpm_target > veh.current_rpm { 3.0 } else { 2.0 };
+                veh.current_rpm += (rpm_target - veh.current_rpm) * (dt * rpm_rate).min(1.0);
+
+                // --- Simulate speed ---
+                veh.current_speed = (veh.current_speed
+                    + accel_input  * 15.0 * dt
+                    - brake_input  * 22.0 * dt
+                    - 2.5          * dt          // rolling friction
+                ).clamp(0.0, veh.max_speed);
+
+                // --- Skid state ---
+                veh.is_skidding = brake_input > 0.3 && veh.current_speed > 4.0;
+
+                // --- Engine audio ---
+                if veh.engine_handle.is_none() {
+                    veh.engine_handle = audio.play_sound(
+                        "assets/sounds/engine_loop.wav", engine_vol, true,
+                    );
+                }
+                if let Some(h) = veh.engine_handle {
+                    let pitch = ENGINE_BASE_PITCH
+                        + (veh.current_rpm / veh.max_rpm) * ENGINE_PITCH_RANGE;
+                    audio.set_speed(h, pitch);
+                    audio.set_volume(h, engine_vol);
+                }
+
+                // --- Wind audio ---
+                if veh.wind_handle.is_none() {
+                    veh.wind_handle = audio.play_sound(
+                        "assets/sounds/wind_loop.wav", 0.0, true,
+                    );
+                }
+                if let Some(h) = veh.wind_handle {
+                    let vol = (veh.current_speed / veh.max_speed).clamp(0.0, 1.0)
+                              * 0.8 * wind_vol;
+                    audio.set_volume(h, vol);
+                }
+
+                // --- Skid audio ---
+                if veh.is_skidding && veh.skid_handle.is_none() {
+                    veh.skid_handle = audio.play_sound(
+                        "assets/sounds/skid.wav", skid_vol, true,
+                    );
+                } else if !veh.is_skidding {
+                    if let Some(h) = veh.skid_handle.take() {
+                        audio.stop(h);
+                    }
+                } else if let Some(h) = veh.skid_handle {
+                    audio.set_volume(h, skid_vol);
+                }
+            }
+        }
+    }
+
+    /// Advance the game state and sync to `game_hud`.
+    ///
+    /// Consumes one-frame actions produced by the previous frame's egui overlay,
+    /// then resets them. No racing logic — just pause/resume/quit.
+    fn update_game(&mut self, _dt: f32) {
+        let resume = self.game_hud.action.resume;
+        let quit   = self.game_hud.action.quit;
+        self.game_hud.action = GameAction::default();
+
+        if resume && self.game.state == GameState::Paused {
+            self.game.state = GameState::Exploring;
+            self.capture_mouse();
+        }
+        if quit {
+            self.game.exit_requested = true;
+        }
+
+        // --- Pull vehicle telemetry for HUD ---
+        let mut speed_kmh = 0.0f32;
+        let mut rpm = 800.0f32;
+        let mut max_rpm = 7000.0f32;
+        for (_, veh) in self.world.query::<&Vehicle>().iter() {
+            speed_kmh = veh.current_speed * 3.6;
+            rpm       = veh.current_rpm;
+            max_rpm   = veh.max_rpm;
+        }
+
+        self.game_hud.kind      = match self.game.state {
+            GameState::Exploring => GameStateKind::Exploring,
+            GameState::Paused    => GameStateKind::Paused,
+        };
+        self.game_hud.speed_kmh = speed_kmh;
+        self.game_hud.rpm       = rpm;
+        self.game_hud.max_rpm   = max_rpm;
+    }
+
+    /// Build the instance list for GPU-driven rendering.
+    /// All instances are submitted (no CPU culling); the compute shader culls via frustum planes.
+    /// The list is sorted by `material_set_index` so material groups are contiguous.
+    fn build_draw_list(&mut self) -> (Vec<DrawInstance>, usize) {
         let mut list = Vec::new();
-        let mut total = 0usize;
 
         for (_, (transform, mr, bbox)) in
             self.world.query::<(&Transform, &MeshRenderer, &BoundingBox)>().iter()
         {
-            total += 1;
             let world_mat = transform.to_mat4();
             let (world_min, world_max) = transform_aabb(bbox.min, bbox.max, world_mat);
-            if is_aabb_visible(world_min, world_max, &planes) {
-                list.push((world_mat, mr.mesh_index, mr.material_set_index));
-            }
+            list.push(DrawInstance {
+                model: world_mat,
+                mesh_index: mr.mesh_index,
+                material_set_index: mr.material_set_index,
+                world_min,
+                world_max,
+            });
         }
 
-        let drawn = list.len();
-        (list, drawn, total)
+        let total = list.len();
+        // Sort by material so the engine can group indirect draws by material set.
+        list.sort_unstable_by_key(|inst| inst.material_set_index);
+        (list, total)
     }
 
     fn poll_gamepad(&mut self) {
@@ -589,6 +987,86 @@ impl App {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Day/Night cycle — keyframe samplers (Fase 29)
+// ---------------------------------------------------------------------------
+
+/// Piecewise-linear sample over a set of (time, value4) keyframes.
+/// `t` must be in [0, 1]. The last keyframe must have t=1.0.
+fn lerp4(kf: &[(f32, [f32; 4])], t: f32) -> [f32; 4] {
+    for w in kf.windows(2) {
+        let (t0, v0) = w[0];
+        let (t1, v1) = w[1];
+        if t <= t1 {
+            let f = if t1 > t0 { (t - t0) / (t1 - t0) } else { 0.0 };
+            return [
+                v0[0] + (v1[0] - v0[0]) * f,
+                v0[1] + (v1[1] - v0[1]) * f,
+                v0[2] + (v1[2] - v0[2]) * f,
+                v0[3] + (v1[3] - v0[3]) * f,
+            ];
+        }
+    }
+    kf.last().map(|(_, v)| *v).unwrap_or([1.0; 4])
+}
+
+/// Sun color and intensity for a given time_of_day.
+///
+/// Color interpolation is **piecewise-linear** between the following keyframes:
+///
+/// | time | color (RGB) | notes |
+/// |------|-------------|-------|
+/// | 0.00 | 1.00, 0.98, 0.95 | Noon — bright cool white |
+/// | 0.20 | 1.00, 0.90, 0.70 | Afternoon — warm |
+/// | 0.25 | 1.00, 0.50, 0.10 | Sunset — deep orange |
+/// | 0.32 | 0.40, 0.15, 0.35 | Dusk — purple |
+/// | 0.40 | 0.05, 0.05, 0.15 | Night — near black |
+/// | 0.50 | 0.03, 0.03, 0.12 | Midnight — darkest |
+/// | 0.60 | 0.05, 0.05, 0.15 | Night |
+/// | 0.68 | 0.40, 0.15, 0.35 | Pre-dawn — purple |
+/// | 0.75 | 1.00, 0.40, 0.10 | Sunrise — rose/orange |
+/// | 0.85 | 1.00, 0.90, 0.70 | Morning — warm |
+/// | 1.00 | 1.00, 0.98, 0.95 | Noon again |
+///
+/// Intensity follows the same keyframes (w channel).
+fn sample_sun_keyframe(t: f32) -> (glam::Vec3, f32) {
+    // [r, g, b, intensity]
+    const KF: &[(f32, [f32; 4])] = &[
+        (0.00, [1.00, 0.98, 0.95, 2.00]),
+        (0.20, [1.00, 0.90, 0.70, 1.50]),
+        (0.25, [1.00, 0.50, 0.10, 0.80]),
+        (0.32, [0.40, 0.15, 0.35, 0.07]),
+        (0.40, [0.05, 0.05, 0.15, 0.02]),
+        (0.50, [0.03, 0.03, 0.12, 0.01]),
+        (0.60, [0.05, 0.05, 0.15, 0.02]),
+        (0.68, [0.40, 0.15, 0.35, 0.07]),
+        (0.75, [1.00, 0.40, 0.10, 0.70]),
+        (0.85, [1.00, 0.90, 0.70, 1.50]),
+        (1.00, [1.00, 0.98, 0.95, 2.00]),
+    ];
+    let [r, g, b, i] = lerp4(KF, t);
+    (glam::Vec3::new(r, g, b), i)
+}
+
+/// Sky cubemap tint (rgb = color multiplier, a = brightness scale) for a given time_of_day.
+/// Applied in `skybox.frag` as: `final_color = sampled * tint.rgb * tint.a`.
+fn sample_sky_tint(t: f32) -> [f32; 4] {
+    const KF: &[(f32, [f32; 4])] = &[
+        (0.00, [1.00, 1.00, 1.00, 1.00]),
+        (0.20, [1.00, 0.95, 0.80, 0.95]),
+        (0.25, [1.00, 0.55, 0.20, 0.85]),
+        (0.32, [0.40, 0.20, 0.50, 0.50]),
+        (0.40, [0.10, 0.10, 0.30, 0.20]),
+        (0.50, [0.05, 0.05, 0.20, 0.12]),
+        (0.60, [0.10, 0.10, 0.30, 0.20]),
+        (0.68, [0.40, 0.20, 0.50, 0.50]),
+        (0.75, [1.00, 0.50, 0.20, 0.85]),
+        (0.85, [1.00, 0.90, 0.75, 0.95]),
+        (1.00, [1.00, 1.00, 1.00, 1.00]),
+    ];
+    lerp4(KF, t)
+}
+
 /// Load scene from `scene.json` if it exists, otherwise fall back to single-model heuristic.
 /// Returns `(scene_data, model_paths)`.
 fn initial_scene_load() -> (SceneData, Vec<String>) {
@@ -608,8 +1086,11 @@ fn initial_scene_load() -> (SceneData, Vec<String>) {
     ];
     for path in &candidates {
         match asset::load_glb(path) {
-            Ok(scene) => {
+            Ok(mut scene) => {
                 log::info!("Loaded fallback model: {path}");
+                // Append builtin cube so cube_mesh_index always points to a real cube.
+                let cube = asset::builtin_cube();
+                scene.meshes.extend(cube.meshes);
                 return (scene, vec![path.to_string()]);
             }
             Err(e) => log::debug!("Skipping {path}: {e}"),
@@ -647,11 +1128,29 @@ impl ApplicationHandler for App {
                 self.debug_ui = Some(DebugUi::new(&window));
                 self.window = Some(window);
 
-                // Spawn initial scene: from scene.json if it exists, else fallback.
-                if let Ok(sf) = load_scene_file(SCENE_PATH) {
-                    self.spawn_from_scene_file(&sf);
-                } else {
-                    self.spawn_scene_default();
+                // Always start with the sandbox scene.
+                // scene.json is only used when the user explicitly clicks Load in the UI.
+                self.spawn_sandbox_scene();
+
+                // Player capsule — dynamic body, rotation locked, no ECS entity.
+                // Ground top at y=0; capsule half_height=0.5 + radius=0.4 → 1.8 m tall.
+                // Center spawns at y=0.9 so feet touch the ground.
+                let player_start = Vec3::new(0.0, PLAYER_SPAWN_Y, 5.0);
+                self.player_body = Some(self.physics.add_player_capsule(player_start));
+                self.camera.position = Vec3::new(player_start.x, player_start.y + EYE_OFFSET, player_start.z);
+
+                // Street lights (Fase 29): 4 lamps around the scene, activated at night.
+                for &pos in &[
+                    Vec3::new( 4.0, 3.0,  4.0),
+                    Vec3::new(-4.0, 3.0,  4.0),
+                    Vec3::new( 4.0, 3.0, -4.0),
+                    Vec3::new(-4.0, 3.0, -4.0),
+                ] {
+                    self.world.spawn((
+                        Transform::from_position(pos),
+                        PointLight { color: Vec3::ONE, intensity: 0.0, radius: 15.0 },
+                        StreetLight { base_intensity: 10.0 },
+                    ));
                 }
 
                 // Ambient audio source (loops throughout the session).
@@ -719,7 +1218,19 @@ impl ApplicationHandler for App {
                         KeyCode::KeyE if !self.mouse_captured && pressed => self.gizmo_mode = GizmoMode::Rotate,
                         KeyCode::KeyR if !self.mouse_captured && pressed => self.gizmo_mode = GizmoMode::Scale,
                         KeyCode::ShiftLeft | KeyCode::ShiftRight => self.input.sprint = pressed,
-                        KeyCode::Escape if pressed => self.release_mouse(),
+                        KeyCode::Space if self.mouse_captured => self.input.brake = pressed,
+                        KeyCode::Escape if pressed => {
+                            match self.game.state {
+                                GameState::Exploring => {
+                                    self.release_mouse();
+                                    self.game.state = GameState::Paused;
+                                }
+                                GameState::Paused => {
+                                    self.game.state = GameState::Exploring;
+                                    self.capture_mouse();
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -871,7 +1382,14 @@ impl ApplicationHandler for App {
                 self.accumulator += dt;
                 let mut all_impacts: Vec<Vec3> = Vec::new();
                 while self.accumulator >= TICK_RATE {
+                    // Look only — position is driven by the physics body below.
                     self.camera.update(&self.input, TICK_RATE);
+
+                    // Drive player capsule: set XZ velocity from input, keep Y from gravity.
+                    if let Some(handle) = self.player_body {
+                        let xz_vel = self.camera.desired_move_velocity(&self.input);
+                        self.physics.set_horizontal_velocity(handle, xz_vel);
+                    }
 
                     // Sync kinematic ECS transforms → rapier before step.
                     for (_, (transform, body)) in
@@ -901,20 +1419,34 @@ impl ApplicationHandler for App {
                         }
                     }
 
+                    // Sync camera position from player physics body.
+                    if let Some(handle) = self.player_body {
+                        if let Some((pos, _)) = self.physics.get_dynamic_pose(handle) {
+                            self.camera.position.x = pos.x;
+                            self.camera.position.y = pos.y + EYE_OFFSET;
+                            self.camera.position.z = pos.z;
+                        }
+                    }
+
                     self.accumulator -= TICK_RATE;
                 }
                 self.input.clear_frame_deltas();
 
-                // Play impact sounds — volume attenuated by distance to camera.
+                // Play impact sounds — distance-attenuated, scaled by effects_volume (Fase 30).
                 if let Some(ref mut engine) = self.audio_engine {
                     let cam_pos = self.camera.position;
+                    let effects_vol = self.vehicle_audio_ui.effects_volume;
                     for impact_pos in all_impacts {
-                        engine.play_spatial(
-                            "assets/sounds/impact.wav",
-                            impact_pos,
-                            cam_pos,
-                            20.0,
-                        );
+                        let dist = (impact_pos - cam_pos).length();
+                        let max_dist = 20.0f32;
+                        if dist < max_dist {
+                            let vol = (1.0 - dist / max_dist).clamp(0.0, 1.0) * effects_vol;
+                            if let Some(h) = engine.play_sound("assets/sounds/impact.wav", vol, false) {
+                                // One-shot: detach from tracking after one frame by just ignoring the handle.
+                                // The slot is reclaimed when the sink finishes (alloc_slot checks `empty()`).
+                                let _ = h;
+                            }
+                        }
                     }
                 }
 
@@ -941,10 +1473,60 @@ impl ApplicationHandler for App {
                     engine.set_muted(self.audio_ui.muted);
                 }
 
+                // Script engine: hot-reload + per-frame tick.
+                // Collect commands first, then release the borrow before acting on them.
+                let script_commands: Vec<ScriptCommand> = if let Some(ref mut se) = self.script_engine {
+                    se.poll_reload();
+                    let cmds = se.update(dt);
+                    self.scripting_ui.scripts = se.scripts.iter()
+                        .map(|s| (s.path.clone(), s.enabled, s.last_error.clone()))
+                        .collect();
+                    self.scripting_ui.log_lines = se.log_lines.iter().cloned().collect();
+                    cmds
+                } else {
+                    Vec::new()
+                };
+                for cmd in script_commands {
+                    match cmd {
+                        ScriptCommand::SpawnCube { position } => {
+                            self.spawn_physics_cube_at(Vec3::from(position));
+                        }
+                        ScriptCommand::PlaySound { path, volume } => {
+                            if let Some(ref mut audio) = self.audio_engine {
+                                audio.play_sound(&path, volume, false);
+                            }
+                        }
+                        ScriptCommand::DestroyEntity { id } => {
+                            if let Some(entity) = hecs::Entity::from_bits(id) {
+                                let _ = self.world.despawn(entity);
+                            }
+                        }
+                        ScriptCommand::SetPosition { id, position } => {
+                            if let Some(entity) = hecs::Entity::from_bits(id) {
+                                if let Ok(mut t) = self.world.get::<&mut Transform>(entity) {
+                                    t.position = Vec3::from(position);
+                                }
+                            }
+                        }
+                        ScriptCommand::Log { message: _ } => {
+                            // Already stored in se.log_lines.
+                        }
+                    }
+                }
+
                 let view_proj = self.camera.view_proj();
-                let lighting_ubo = self.build_lighting_ubo();
-                let (draw_list, drawn, total) = self.build_draw_list(view_proj);
-                self.last_drawn = drawn;
+                let proj = self.camera.projection();
+
+                // Day/night cycle: update ECS lights + compute sky tint before building UBO.
+                let sky_tint = self.update_day_night(dt);
+
+                // Game state machine: consume overlay actions, advance timer/checkpoints.
+                self.update_game(dt);
+
+
+                let lighting_ubo = self.build_lighting_ubo(view_proj);
+                let (draw_list, total) = self.build_draw_list();
+                self.last_drawn = total; // GPU reports actual drawn count; CPU tracks submitted
                 self.last_total = total;
 
                 // Object picking (ray-AABB) — executed when user clicked in editor mode.
@@ -1060,17 +1642,38 @@ impl ApplicationHandler for App {
                 let prev_msaa = self.debug_settings.msaa_samples;
                 let (egui_primitives, egui_textures_delta) =
                     if let (Some(ui), Some(window)) = (&mut self.debug_ui, &self.window) {
+                        let gpu_timings = if let Some(vulkan) = &self.vulkan {
+                            let p = vulkan.gpu_profiler();
+                            ui::GpuTimings {
+                                available: p.supports_timestamps,
+                                passes: p.results.iter().map(|t| (t.name.clone(), t.ms)).collect(),
+                                total_ms: p.total_ms,
+                                stats_available: p.supports_pipeline_stats,
+                                vertex_invocations: p.pipeline_stats.vertex_invocations,
+                                fragment_invocations: p.pipeline_stats.fragment_invocations,
+                                clipping_primitives: p.pipeline_stats.clipping_primitives,
+                            }
+                        } else {
+                            ui::GpuTimings::default()
+                        };
                         let stats = FrameStats {
                             fps: self.last_fps,
                             frame_ms: dt * 1000.0,
                             draw_calls: self.last_drawn,
                             total_entities: self.last_total,
                             reload_log: self.reload_log.clone(),
+                            gpu_timings,
                         };
-                        ui.build(window, &stats, &mut self.world, &mut self.debug_settings, &mut self.scene_ui, &mut self.physics_ui, &mut self.audio_ui, &mut self.editor_ui)
+                        ui.build(window, &stats, &mut self.world, &mut self.debug_settings, &mut self.scene_ui, &mut self.physics_ui, &mut self.audio_ui, &mut self.editor_ui, &self.scripting_ui, &mut self.day_night_ui, &mut self.vehicle_audio_ui, &mut self.game_hud)
                     } else {
                         (vec![], egui::TexturesDelta::default())
                     };
+
+                // Exit app if the player clicked Quit from the main menu.
+                if self.game.exit_requested {
+                    event_loop.exit();
+                    return;
+                }
 
                 // Handle save (no GPU involvement — safe any time).
                 let pending_save = self.scene_ui.save_clicked;
@@ -1124,6 +1727,7 @@ impl ApplicationHandler for App {
                     if let Err(e) = vulkan.draw_frame(
                         window,
                         view_proj,
+                        proj,
                         lighting_ubo,
                         &draw_list,
                         &wireframe_lines,
@@ -1137,16 +1741,32 @@ impl ApplicationHandler for App {
                         0.8,   // bloom_intensity
                         1.0,   // bloom_threshold
                         self.debug_settings.tone_aces,
+                        self.debug_settings.ssao_enabled,
+                        self.debug_settings.ssao_radius,
+                        self.debug_settings.ssao_bias,
+                        self.debug_settings.ssao_power,
+                        self.debug_settings.ssao_strength,
+                        self.debug_settings.ssao_sample_count,
+                        self.debug_settings.lod_distance_step,
+                        sky_tint,
                     ) {
                         log::error!("Frame error: {e:#}");
                         event_loop.exit();
                     }
                 }
 
-                // Scene load: runs after draw_frame so the current draw_list isn't
-                // invalidated mid-frame. Next frame will see the new GPU resources + world.
+                // Kick off an async load when the user clicks "Load Scene".
+                // The actual GLB parsing runs on a background thread; we poll below.
                 if pending_load {
-                    match self.load_scene() {
+                    if let Err(e) = self.load_scene() {
+                        self.scene_ui.status = format!("✗ Load failed: {e}");
+                        log::error!("Load scene failed: {e:#}");
+                    }
+                }
+
+                // Poll the async loader every frame. When it finishes, apply to GPU + world.
+                if let Some(result) = self.asset_loader.poll_complete() {
+                    match result.and_then(|(scene, models)| self.apply_loaded_scene(scene, models)) {
                         Ok(()) => {
                             self.scene_ui.status = format!(
                                 "✓ Loaded ({} models, {} entities)",
@@ -1156,10 +1776,13 @@ impl ApplicationHandler for App {
                         }
                         Err(e) => {
                             self.scene_ui.status = format!("✗ Load failed: {e}");
-                            log::error!("Load scene failed: {e:#}");
+                            log::error!("Apply scene failed: {e:#}");
                         }
                     }
                 }
+
+                // Sync loading state to the UI (panel disables buttons while loading).
+                self.scene_ui.is_loading = self.asset_loader.is_loading();
             }
 
             _ => {}

@@ -9,19 +9,79 @@ use winit::window::Window;
 
 use gpu_allocator::MemoryLocation;
 
-use super::gpu_resources::{BufferHandle, GpuMesh, GpuResourceManager, ImageHandle};
-use super::render_graph::{RenderGraph, ResourceAccess};
+use super::gpu_resources::{
+    BufferHandle, DrawIndirectCommand, GpuMesh, GpuMeshInfo, GpuMeshLod, GpuMeshLodInfo,
+    GpuResourceManager, ImageHandle, InstanceData,
+};
+use super::render_graph::{BufferBarrier, RenderGraph, ResourceAccess};
 use super::vertex::Vertex;
 use crate::asset::SceneData;
 use crate::scene::LightingUbo;
 
-/// Push constant layout (128 bytes = Vulkan minimum).
-/// bytes  0..64 = MVP matrix, bytes 64..128 = model matrix.
+/// Maximum number of renderable instances the GPU buffers can hold.
+/// Determines the size of the instance SSBO and indirect draw buffer.
+const MAX_INSTANCES: usize = 4096;
+
+/// Per-instance data built on the CPU and passed to `draw_frame`.
+/// Sorted by `material_set_index` before upload so draw groups are contiguous.
+pub struct DrawInstance {
+    pub model: glam::Mat4,
+    pub mesh_index: usize,
+    pub material_set_index: usize,
+    pub world_min: glam::Vec3,
+    pub world_max: glam::Vec3,
+}
+
+/// A contiguous group of instances sharing the same material descriptor set.
+/// Used to bind the material set once and call `cmd_draw_indexed_indirect` for the group.
+struct MaterialGroup {
+    material_set_index: usize,
+    first_draw: u32,   // index into the indirect draw buffer
+    draw_count: u32,   // number of draw commands in this group
+}
+
+/// SSAO uniform buffer (std140). Layout matches the GLSL SsaoUbo block in ssao.frag.
+/// Total: 64 + 64 + 512 + 16 + 8 + 8 = 672 bytes.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct MeshPushConstants {
-    mvp:   glam::Mat4,
-    model: glam::Mat4,
+struct SsaoUbo {
+    proj:         [f32; 16],       // 64 bytes — perspective projection matrix
+    inv_proj:     [f32; 16],       // 64 bytes — inverse projection matrix
+    kernel:       [[f32; 4]; 32],  // 512 bytes — hemisphere samples (xyz used, w=0)
+    radius:       f32,             // 4 bytes
+    bias:         f32,             // 4 bytes
+    power:        f32,             // 4 bytes
+    sample_count: f32,             // 4 bytes (float for shader convenience)
+    noise_scale:  [f32; 2],        // 8 bytes — screen_size / 4.0
+    _pad:         [f32; 2],        // 8 bytes padding to 16-byte boundary
+}
+
+/// Generate a hemisphere sample kernel (32 samples, accelerating distribution).
+/// Deterministic pseudo-random using xorshift64.
+fn generate_ssao_kernel() -> [[f32; 4]; 32] {
+    let mut rng = 12345_u64;
+    let mut next_f32 = move || -> f32 {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        // Map to [0, 1]
+        (rng >> 11) as f32 / ((1_u64 << 53) as f32)
+    };
+
+    let mut kernel = [[0_f32; 4]; 32];
+    for (i, slot) in kernel.iter_mut().enumerate() {
+        // Random point in hemisphere (z >= 0)
+        let x = next_f32() * 2.0 - 1.0;
+        let y = next_f32() * 2.0 - 1.0;
+        let z = next_f32(); // [0,1] — hemisphere (positive z)
+        let len = (x * x + y * y + z * z).sqrt().max(1e-6);
+        let (x, y, z) = (x / len, y / len, z / len);
+        // Accelerating scale: samples cluster near origin for better self-occlusion
+        let t = i as f32 / 32.0;
+        let scale = 0.1 + t * t * 0.9;
+        *slot = [x * scale, y * scale, z * scale, 0.0];
+    }
+    kernel
 }
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
@@ -122,10 +182,53 @@ pub struct VulkanContext {
     bloom_upsample_pipeline: vk::Pipeline,
     composite_pipeline_layout: vk::PipelineLayout,
     composite_pipeline: vk::Pipeline,
+    // SSAO
+    /// Layout the depth image is actually in at the start of each frame.
+    /// Starts as DEPTH_STENCIL_ATTACHMENT_OPTIMAL; becomes SHADER_READ_ONLY after SSAO reads it.
+    depth_initial_layout: vk::ImageLayout,
+    ssao_sampler: vk::Sampler,                                    // NEAREST, CLAMP_TO_EDGE
+    /// Depth-only image view for SSAO sampling (Vulkan forbids DEPTH|STENCIL in sampler2D).
+    ssao_depth_view: vk::ImageView,
+    ssao_noise_image: ImageHandle,                                 // 4×4 RGBA8 (RG = random)
+    ssao_raw_image: ImageHandle,                                   // R8_UNORM full-res AO
+    ssao_blurred_image: ImageHandle,                               // R8_UNORM full-res blurred
+    ssao_set_layout: vk::DescriptorSetLayout,                      // depth+noise+ubo
+    ssao_blur_set_layout: vk::DescriptorSetLayout,                 // ssao_raw
+    ssao_descriptor_pool: vk::DescriptorPool,
+    ssao_descriptor_sets: Vec<vk::DescriptorSet>,                  // [MAX_FRAMES_IN_FLIGHT]
+    ssao_blur_descriptor_set: vk::DescriptorSet,
+    ssao_ubo_buffers: Vec<BufferHandle>,                           // [MAX_FRAMES_IN_FLIGHT]
+    ssao_pipeline_layout: vk::PipelineLayout,
+    ssao_pipeline: vk::Pipeline,
+    ssao_blur_pipeline_layout: vk::PipelineLayout,
+    ssao_blur_pipeline: vk::Pipeline,
     // egui renderer (Option so we can take+drop it before device destruction)
     egui_renderer: Option<EguiRenderer>,
     // Per-frame-in-flight lists of egui texture IDs to free after the GPU finishes.
     egui_textures_to_free: [Vec<egui::TextureId>; MAX_FRAMES_IN_FLIGHT],
+    // GPU profiler (timestamp + pipeline statistics queries)
+    profiler: super::gpu_profiler::GpuProfiler,
+    // GPU-driven rendering (Fase 23)
+    /// Single vertex buffer containing all scene mesh vertices packed sequentially.
+    mega_vertex_buffer: Option<BufferHandle>,
+    /// Single index buffer containing all scene mesh indices packed sequentially.
+    mega_index_buffer: Option<BufferHandle>,
+    /// Static SSBO with first_index/index_count/vertex_offset per mesh (GpuOnly, rebuilt on scene load).
+    mesh_info_ssbo: Option<BufferHandle>,
+    /// Per-frame instance SSBOs: model matrices + world AABB written by CPU each frame (CpuToGpu).
+    instance_ssbo_buffers: Vec<BufferHandle>,
+    /// Per-frame indirect draw buffers: VkDrawIndexedIndirectCommand written by compute shader (GpuOnly).
+    cull_draw_buffers: Vec<BufferHandle>,
+    /// Descriptor set layout for the compute cull pass.
+    cull_set_layout: vk::DescriptorSetLayout,
+    /// Descriptor pool for cull descriptor sets (one per frame).
+    cull_descriptor_pool: vk::DescriptorPool,
+    /// Descriptor sets for the cull compute pass (one per frame-in-flight).
+    cull_descriptor_sets: Vec<vk::DescriptorSet>,
+    /// Pipeline layout for the cull compute pass (push constant: instance_count).
+    cull_pipeline_layout: vk::PipelineLayout,
+    /// Compute pipeline that performs GPU frustum culling and writes indirect draw commands.
+    cull_pipeline: vk::Pipeline,
 }
 
 // ---------------------------------------------------------------------------
@@ -370,12 +473,15 @@ fn select_physical_device(
     best.context("No suitable Vulkan 1.2+ GPU found (need swapchain + dynamic rendering)")
 }
 
+/// Returns `(device, queue, pipeline_stats_enabled)`.
+/// `pipeline_stats_enabled` is true when `pipelineStatisticsQuery` was available
+/// on the physical device and was enabled in the logical device.
 fn create_logical_device(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
     queue_family_index: u32,
     supports_vulkan_13: bool,
-) -> Result<(ash::Device, vk::Queue)> {
+) -> Result<(ash::Device, vk::Queue, bool)> {
     let queue_priority = [1.0f32];
     let queue_create_info = vk::DeviceQueueCreateInfo::default()
         .queue_family_index(queue_family_index)
@@ -401,17 +507,39 @@ fn create_logical_device(
         extension_names.push(c"VK_KHR_portability_subset".as_ptr());
     }
 
+    // Query which optional features the physical device supports.
+    // SAFETY: instance and physical_device are valid.
+    let supported_features =
+        unsafe { instance.get_physical_device_features(physical_device) };
+    let has_pipeline_stats = supported_features.pipeline_statistics_query == vk::TRUE;
+
+    // Build the core feature set: always enable fillModeNonSolid (wireframe) and,
+    // if available, pipelineStatisticsQuery (GPU profiling).
+    let mut enabled_features = vk::PhysicalDeviceFeatures::default()
+        .fill_mode_non_solid(true);
+    if has_pipeline_stats {
+        enabled_features = enabled_features.pipeline_statistics_query(true);
+    }
+
     // Enable dynamic rendering: Vulkan13Features for 1.3, extension features for 1.2.
     let mut dynamic_rendering_features =
         vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
     let mut vulkan_13_features =
         vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true);
 
+    // gl_BaseInstance (GLSL 4.60, DrawParameters SPIR-V capability) requires
+    // shaderDrawParameters from Vulkan 1.1. Always available on Vulkan 1.2+ hardware.
+    let mut vulkan_11_features =
+        vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
+
     let device_create_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_create_infos)
-        .enabled_extension_names(&extension_names);
+        .enabled_extension_names(&extension_names)
+        .enabled_features(&enabled_features);
 
+    // Chain Vulkan 1.1 features first (always), then dynamic rendering.
     // Vulkan spec: do NOT chain both Vulkan13Features and DynamicRenderingFeatures.
+    let device_create_info = device_create_info.push_next(&mut vulkan_11_features);
     let device_create_info = if supports_vulkan_13 {
         device_create_info.push_next(&mut vulkan_13_features)
     } else {
@@ -426,14 +554,10 @@ fn create_logical_device(
     let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
     log::info!(
-        "Logical device created (queue family {queue_family_index}, {})",
-        if supports_vulkan_13 {
-            "Vulkan 1.3"
-        } else {
-            "Vulkan 1.2 + KHR extensions"
-        }
+        "Logical device created (queue family {queue_family_index}, {}, pipeline_stats={has_pipeline_stats})",
+        if supports_vulkan_13 { "Vulkan 1.3" } else { "Vulkan 1.2 + KHR extensions" }
     );
-    Ok((device, queue))
+    Ok((device, queue, has_pipeline_stats))
 }
 
 fn create_swapchain(
@@ -713,6 +837,97 @@ fn write_material_set(
     unsafe { device.update_descriptor_sets(&writes, &[]) };
 }
 
+/// LOD target ratios: 100%, 50%, 25%, 12.5%.
+const LOD_RATIOS: [f32; 4] = [1.0, 0.5, 0.25, 0.125];
+
+/// Build the mega vertex/index buffers and per-mesh GpuMesh descriptors from scene mesh data.
+/// Fase 24: generates up to 4 LOD levels per mesh using meshopt simplification.
+/// All LOD index ranges are packed into the shared mega index buffer.
+/// Returns (gpu_meshes, mega_vb, mega_ib, mesh_info_ssbo).
+fn build_scene_mega_buffers(
+    rm: &mut GpuResourceManager,
+    mesh_data: &[crate::asset::MeshData],
+) -> Result<(Vec<GpuMesh>, Option<BufferHandle>, Option<BufferHandle>, Option<BufferHandle>)> {
+    if mesh_data.is_empty() {
+        return Ok((Vec::new(), None, None, None));
+    }
+
+    let mut all_vertices: Vec<Vertex> = Vec::new();
+    let mut all_indices:  Vec<u32>    = Vec::new();
+    let mut gpu_meshes   = Vec::with_capacity(mesh_data.len());
+    let mut mesh_infos   = Vec::with_capacity(mesh_data.len());
+
+    for data in mesh_data {
+        let vertex_offset = all_vertices.len() as i32;
+
+        // Build a VertexDataAdapter over just the position (offset 0, stride = Vertex size).
+        // meshopt only needs positions to decide which vertices to merge during simplification.
+        let vertex_bytes = bytemuck::cast_slice::<Vertex, u8>(&data.vertices);
+        let adapter = meshopt::VertexDataAdapter::new(
+            vertex_bytes,
+            std::mem::size_of::<Vertex>(),
+            0, // position is at offset 0
+        ).map_err(|e| anyhow::anyhow!("meshopt VertexDataAdapter failed: {:?}", e))?;
+
+        let mut lods      = [GpuMeshLod { first_index: 0, index_count: 0 }; 4];
+        let mut lod_infos = [GpuMeshLodInfo { first_index: 0, index_count: 0 }; 4];
+        let mut lod_count = 0u32;
+        let original_count = data.indices.len();
+
+        for (level, &ratio) in LOD_RATIOS.iter().enumerate() {
+            let first_index = all_indices.len() as u32;
+            let level_indices: Vec<u32> = if ratio >= 1.0 {
+                // LOD 0: use the original indices unchanged.
+                data.indices.clone()
+            } else {
+                let target = ((original_count as f32 * ratio) as usize / 3 * 3).max(3);
+                let simplified = meshopt::simplify(
+                    &data.indices,
+                    &adapter,
+                    target,
+                    0.02, // target_error — allow up to 2% geometric error per level
+                    meshopt::SimplifyOptions::None,
+                    None,
+                );
+                // If simplification produced no triangles, stop adding LODs.
+                if simplified.is_empty() { break; }
+                simplified
+            };
+
+            let index_count = level_indices.len() as u32;
+            all_indices.extend_from_slice(&level_indices);
+
+            lods[level]      = GpuMeshLod      { first_index, index_count };
+            lod_infos[level] = GpuMeshLodInfo  { first_index, index_count };
+            lod_count = level as u32 + 1;
+
+            // Stop if we can't reduce further (only one triangle left).
+            if index_count <= 3 { break; }
+        }
+
+        all_vertices.extend_from_slice(&data.vertices);
+
+        gpu_meshes.push(GpuMesh { lods, lod_count, vertex_offset });
+        mesh_infos.push(GpuMeshInfo {
+            lods:          lod_infos,
+            vertex_offset,
+            lod_count,
+            _pad: [0; 2],
+        });
+    }
+
+    let (mega_vb, mega_ib) = rm.build_mega_buffers(&all_vertices, &all_indices)?;
+
+    // Upload static mesh-info SSBO (GpuOnly — never changes between frames).
+    let mesh_info_bytes = bytemuck::cast_slice::<GpuMeshInfo, u8>(&mesh_infos);
+    let mesh_info_ssbo = rm.upload_to_device_local(
+        mesh_info_bytes,
+        vk::BufferUsageFlags::STORAGE_BUFFER,
+    )?;
+
+    Ok((gpu_meshes, Some(mega_vb), Some(mega_ib), Some(mesh_info_ssbo)))
+}
+
 impl VulkanContext {
     pub fn new(window: &Window, scene_data: &SceneData) -> Result<Self> {
         // SAFETY: loads libvulkan dynamically at runtime (MoltenVK on macOS, loader on Linux).
@@ -726,7 +941,7 @@ impl VulkanContext {
         let (surface_loader, surface) = create_surface(&entry, &instance, window)?;
         let (physical_device, queue_family_index, supports_vulkan_13) =
             select_physical_device(&instance, &surface_loader, surface)?;
-        let (device, graphics_queue) =
+        let (device, graphics_queue, pipeline_stats_enabled) =
             create_logical_device(&instance, physical_device, queue_family_index, supports_vulkan_13)?;
         let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
         // KHR loader works on both 1.2+ext and 1.3 (promoted functions are aliased).
@@ -809,7 +1024,8 @@ impl VulkanContext {
             swapchain_extent.width,
             swapchain_extent.height,
             depth_format,
-            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            // SAMPLED added so SSAO can read depth after the main pass.
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
             depth_aspect(depth_format),
             vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
             vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
@@ -982,8 +1198,32 @@ impl VulkanContext {
             ubo_buffers.push(buf);
         }
 
-        // --- Lighting descriptor pool (set 0): UBO + 4 image samplers per frame ---
-        // Bindings: 0=UBO, 1=shadow, 2=irradiance, 3=prefiltered, 4=BRDF LUT
+        // Instance SSBOs: one per frame, CpuToGpu. Written by CPU, read by compute + vertex.
+        let instance_ssbo_size = (MAX_INSTANCES * std::mem::size_of::<InstanceData>()) as u64;
+        let mut instance_ssbo_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
+        for _ in 0..MAX_FRAMES_IN_FLIGHT {
+            let buf = resource_manager.create_buffer(
+                instance_ssbo_size,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                MemoryLocation::CpuToGpu,
+            )?;
+            instance_ssbo_buffers.push(buf);
+        }
+
+        // Indirect draw buffers: one per frame, GpuOnly. Written by compute, read by draw indirect.
+        let draw_buf_size = (MAX_INSTANCES * std::mem::size_of::<DrawIndirectCommand>()) as u64;
+        let mut cull_draw_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
+        for _ in 0..MAX_FRAMES_IN_FLIGHT {
+            let buf = resource_manager.create_buffer(
+                draw_buf_size,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::INDIRECT_BUFFER,
+                MemoryLocation::GpuOnly,
+            )?;
+            cull_draw_buffers.push(buf);
+        }
+
+        // --- Lighting descriptor pool (set 0): UBO + 4 image samplers + 1 SSBO per frame ---
+        // Bindings: 0=UBO, 1=shadow, 2=irradiance, 3=prefiltered, 4=BRDF LUT, 5=instance SSBO
         let lighting_pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
@@ -992,6 +1232,10 @@ impl VulkanContext {
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                 descriptor_count: (MAX_FRAMES_IN_FLIGHT * 4) as u32,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_BUFFER,
+                descriptor_count: MAX_FRAMES_IN_FLIGHT as u32, // instance SSBO (binding 5)
             },
         ];
         let lighting_pool_info = vk::DescriptorPoolCreateInfo::default()
@@ -1012,9 +1256,9 @@ impl VulkanContext {
             unsafe { device.allocate_descriptor_sets(&lighting_alloc_info) }
                 .context("Failed to allocate lighting descriptor sets")?;
 
-        // Point each descriptor set at its UBO + all image samplers.
-        // Bindings: 0=UBO, 1=shadow, 2=irradiance, 3=prefiltered, 4=BRDF LUT.
-        // IBL images are static (same view for all frames); only the UBO changes per frame.
+        // Point each descriptor set at its UBO + image samplers + instance SSBO.
+        // Bindings: 0=UBO, 1=shadow, 2=irradiance, 3=prefiltered, 4=BRDF LUT, 5=instance SSBO.
+        // IBL images are static (same view for all frames); UBO and SSBO are per-frame.
         let shadow_view      = resource_manager.get_image_view(shadow_map);
         let irr_view         = resource_manager.get_image_view(irradiance_image);
         let pre_view         = resource_manager.get_image_view(prefiltered_image);
@@ -1022,6 +1266,10 @@ impl VulkanContext {
         for (i, &set) in descriptor_sets.iter().enumerate() {
             let buffer = resource_manager.get_buffer(ubo_buffers[i]);
             let buffer_info = [vk::DescriptorBufferInfo { buffer, offset: 0, range: ubo_size }];
+            let inst_buf = resource_manager.get_buffer(instance_ssbo_buffers[i]);
+            let inst_info = [vk::DescriptorBufferInfo {
+                buffer: inst_buf, offset: 0, range: instance_ssbo_size,
+            }];
             let shadow_info = [vk::DescriptorImageInfo {
                 sampler: shadow_sampler, image_view: shadow_view,
                 image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
@@ -1059,8 +1307,12 @@ impl VulkanContext {
                     .dst_set(set).dst_binding(4)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .image_info(&brdf_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set).dst_binding(5)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&inst_info),
             ];
-            // SAFETY: set, buffer, image views, and samplers are all valid.
+            // SAFETY: set, buffer, image views, samplers, and SSBO are all valid.
             unsafe { device.update_descriptor_sets(&writes, &[]) };
         }
         log::info!("Lighting descriptor sets created ({MAX_FRAMES_IN_FLIGHT} frames, 5 bindings each)");
@@ -1147,12 +1399,11 @@ impl VulkanContext {
         unsafe { device.update_descriptor_sets(&skybox_write, &[]) };
         log::info!("Skybox descriptor set created");
 
-        // --- Upload meshes (transforms and per-draw selection come from ECS) ---
-        let mut gpu_meshes: Vec<GpuMesh> = Vec::with_capacity(scene_data.meshes.len());
-        for data in &scene_data.meshes {
-            let mesh = resource_manager.upload_mesh(&data.vertices, &data.indices)?;
-            gpu_meshes.push(mesh);
-        }
+        // --- Build mega vertex/index buffers + per-mesh GpuMesh descriptors ---
+        // All mesh geometry is packed into two shared device-local buffers.
+        // Individual meshes are addressed via first_index / vertex_offset.
+        let (gpu_meshes, mega_vertex_buffer, mega_index_buffer, mesh_info_ssbo) =
+            build_scene_mega_buffers(&mut resource_manager, &scene_data.meshes)?;
         let (command_pool, command_buffers) =
             create_command_pool_and_buffers(&device, queue_family_index)?;
         let (image_available_semaphores, render_finished_semaphores, in_flight_fences) =
@@ -1259,10 +1510,10 @@ impl VulkanContext {
         let composite_set_layout = super::pipeline::create_composite_descriptor_set_layout(&device)?;
 
         // --- Bloom + composite descriptor pool ---
-        // BLOOM_LEVELS ds-sets + (BLOOM_LEVELS-1) up-sets + 1 composite = 11 sets, max samplers.
+        // BLOOM_LEVELS ds-sets + (BLOOM_LEVELS-1) up-sets + 1 composite (3 samplers now) = 13.
         let bloom_pool_sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-            descriptor_count: (BLOOM_LEVELS * 2 + 2) as u32,
+            descriptor_count: (BLOOM_LEVELS * 2 + 3) as u32,
         }];
         let bloom_pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets((BLOOM_LEVELS * 2 + 1) as u32)
@@ -1369,6 +1620,221 @@ impl VulkanContext {
         unsafe { device.update_descriptor_sets(&comp_writes, &[]) };
         log::info!("Bloom descriptor sets written");
 
+        // -----------------------------------------------------------------------
+        // SSAO resources
+        // -----------------------------------------------------------------------
+
+        // --- SSAO sampler (NEAREST, CLAMP_TO_EDGE — no filtering for depth/AO) ---
+        let ssao_sampler = unsafe {
+            device.create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::NEAREST)
+                    .min_filter(vk::Filter::NEAREST)
+                    .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .max_lod(0.0),
+                None,
+            )
+        }
+        .context("Failed to create SSAO sampler")?;
+
+        // --- SSAO depth-only image view for sampling (Vulkan forbids DEPTH|STENCIL for sampler2D) ---
+        // For D32_SFLOAT the existing view is already depth-only; for D24_S8 we need a fresh view.
+        let ssao_depth_view = unsafe {
+            device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(resource_manager.get_image_raw(depth_image))
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(depth_format)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::DEPTH, // always depth-only for sampling
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    }),
+                None,
+            )
+        }
+        .context("Failed to create SSAO depth-only image view")?;
+
+        // --- SSAO 4×4 noise texture (RGBA8, RG = random tangent rotation vectors) ---
+        let ssao_noise_image = {
+            let mut rng = 98765_u64;
+            let mut noise_pixels = vec![0u8; 4 * 4 * 4]; // 16 pixels × 4 bytes (RGBA8)
+            for chunk in noise_pixels.chunks_mut(4) {
+                rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+                chunk[0] = (rng & 0xFF) as u8; // R — random X
+                rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+                chunk[1] = (rng & 0xFF) as u8; // G — random Y  (B, A unused, stay 0)
+            }
+            resource_manager.upload_texture(&noise_pixels, 4, 4, vk::Format::R8G8B8A8_UNORM)?
+        };
+
+        // --- SSAO AO render target images (R8_UNORM, full resolution) ---
+        let ssao_raw_image = resource_manager.create_attachment_image(
+            swapchain_extent.width, swapchain_extent.height,
+            vk::Format::R8_UNORM,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            vk::ImageAspectFlags::COLOR,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::AccessFlags::SHADER_READ,
+        )?;
+        let ssao_blurred_image = resource_manager.create_attachment_image(
+            swapchain_extent.width, swapchain_extent.height,
+            vk::Format::R8_UNORM,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            vk::ImageAspectFlags::COLOR,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::AccessFlags::SHADER_READ,
+        )?;
+
+        // --- SSAO UBO buffers (one per frame-in-flight) ---
+        let ssao_ubo_buffers: Vec<BufferHandle> = (0..MAX_FRAMES_IN_FLIGHT)
+            .map(|_| {
+                resource_manager.create_buffer(
+                    std::mem::size_of::<SsaoUbo>() as u64,
+                    vk::BufferUsageFlags::UNIFORM_BUFFER,
+                    MemoryLocation::CpuToGpu,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // --- SSAO descriptor set layouts ---
+        let ssao_set_layout = super::pipeline::create_ssao_descriptor_set_layout(&device)?;
+        let ssao_blur_set_layout =
+            super::pipeline::create_ssao_blur_descriptor_set_layout(&device)?;
+
+        // --- SSAO descriptor pool: MAX_FRAMES_IN_FLIGHT main sets + 1 blur set ---
+        let ssao_pool_sizes = [
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                descriptor_count: (MAX_FRAMES_IN_FLIGHT * 2 + 1) as u32, // 2 samplers/main + 1 blur
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::UNIFORM_BUFFER,
+                descriptor_count: MAX_FRAMES_IN_FLIGHT as u32,
+            },
+        ];
+        let ssao_descriptor_pool = unsafe {
+            device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets((MAX_FRAMES_IN_FLIGHT + 1) as u32)
+                    .pool_sizes(&ssao_pool_sizes),
+                None,
+            )
+        }
+        .context("Failed to create SSAO descriptor pool")?;
+
+        // --- Allocate SSAO main sets (one per frame-in-flight) ---
+        let ssao_main_layouts: Vec<_> = vec![ssao_set_layout; MAX_FRAMES_IN_FLIGHT];
+        let ssao_descriptor_sets = unsafe {
+            device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(ssao_descriptor_pool)
+                    .set_layouts(&ssao_main_layouts),
+            )
+        }
+        .context("Failed to allocate SSAO descriptor sets")?;
+
+        // --- Allocate SSAO blur set ---
+        let blur_layouts = [ssao_blur_set_layout];
+        let ssao_blur_descriptor_set = unsafe {
+            device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(ssao_descriptor_pool)
+                    .set_layouts(&blur_layouts),
+            )
+        }
+        .context("Failed to allocate SSAO blur descriptor set")?[0];
+
+        // --- Write SSAO main descriptor sets (binding 0=depth, 1=noise, 2=UBO) ---
+        let ssao_depth_info = [vk::DescriptorImageInfo {
+            sampler: ssao_sampler,
+            image_view: ssao_depth_view,
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        }];
+        let ssao_noise_info = [vk::DescriptorImageInfo {
+            sampler: ssao_sampler,
+            image_view: resource_manager.get_image_view(ssao_noise_image),
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        }];
+        for (i, &set) in ssao_descriptor_sets.iter().enumerate() {
+            let buf_info = [vk::DescriptorBufferInfo {
+                buffer: resource_manager.get_buffer(ssao_ubo_buffers[i]),
+                offset: 0,
+                range: std::mem::size_of::<SsaoUbo>() as u64,
+            }];
+            // SAFETY: set, views, sampler, and buffer are all valid.
+            unsafe {
+                device.update_descriptor_sets(
+                    &[
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(set).dst_binding(0)
+                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                            .image_info(&ssao_depth_info),
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(set).dst_binding(1)
+                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                            .image_info(&ssao_noise_info),
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(set).dst_binding(2)
+                            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                            .buffer_info(&buf_info),
+                    ],
+                    &[],
+                );
+            }
+        }
+
+        // --- Write SSAO blur descriptor set (binding 0 = ssao_raw) ---
+        let ssao_raw_info = [vk::DescriptorImageInfo {
+            sampler: ssao_sampler,
+            image_view: resource_manager.get_image_view(ssao_raw_image),
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        }];
+        // SAFETY: set, view, sampler valid.
+        unsafe {
+            device.update_descriptor_sets(
+                &[vk::WriteDescriptorSet::default()
+                    .dst_set(ssao_blur_descriptor_set).dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&ssao_raw_info)],
+                &[],
+            );
+        }
+
+        // --- Update composite descriptor set binding 2 = ssao_blurred ---
+        // The composite set was allocated/written above (binding 0+1 = hdr+bloom).
+        // We add binding 2 here after SSAO images are created.
+        let ssao_blurred_comp_info = [vk::DescriptorImageInfo {
+            sampler: bloom_sampler,
+            image_view: resource_manager.get_image_view(ssao_blurred_image),
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        }];
+        // SAFETY: composite_descriptor_set is valid; ssao_blurred image view is valid.
+        unsafe {
+            device.update_descriptor_sets(
+                &[vk::WriteDescriptorSet::default()
+                    .dst_set(composite_descriptor_set).dst_binding(2)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&ssao_blurred_comp_info)],
+                &[],
+            );
+        }
+        log::info!("SSAO resources created (noise 4×4, raw+blurred {}×{})",
+            swapchain_extent.width, swapchain_extent.height);
+
+        // --- SSAO pipelines ---
+        let (ssao_pipeline_layout, ssao_pipeline) =
+            super::pipeline::create_ssao_pipeline(&device, ssao_set_layout)?;
+        let (ssao_blur_pipeline_layout, ssao_blur_pipeline) =
+            super::pipeline::create_ssao_blur_pipeline(&device, ssao_blur_set_layout)?;
+
         // --- Bloom pipelines ---
         let (bloom_downsample_pipeline_layout, bloom_downsample_pipeline) =
             super::pipeline::create_bloom_pipeline(
@@ -1386,6 +1852,98 @@ impl VulkanContext {
             super::pipeline::create_composite_pipeline(
                 &device, composite_set_layout, swapchain_format,
             )?;
+
+        // Initialize GPU profiler (uses device and instance before they are moved into Self).
+        let profiler = super::gpu_profiler::GpuProfiler::new(
+            &device,
+            physical_device,
+            &instance,
+            queue_family_index,
+            pipeline_stats_enabled,
+        )?;
+
+        // --- Cull compute pipeline (Fase 23 GPU-driven rendering) ---
+        let cull_set_layout = super::pipeline::create_cull_descriptor_set_layout(&device)?;
+        let (cull_pipeline_layout, cull_pipeline) = super::pipeline::create_cull_pipeline(
+            &device,
+            super::pipeline::CULL_COMP_SPV,
+            cull_set_layout,
+        )?;
+
+        // Cull descriptor pool: 4 SSBO/UBO bindings × MAX_FRAMES_IN_FLIGHT sets.
+        let cull_pool_sizes = [
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::UNIFORM_BUFFER,
+                descriptor_count: MAX_FRAMES_IN_FLIGHT as u32,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_BUFFER,
+                descriptor_count: (MAX_FRAMES_IN_FLIGHT * 3) as u32,
+            },
+        ];
+        let cull_pool_info = vk::DescriptorPoolCreateInfo::default()
+            .pool_sizes(&cull_pool_sizes)
+            .max_sets(MAX_FRAMES_IN_FLIGHT as u32);
+        // SAFETY: device is valid.
+        let cull_descriptor_pool =
+            unsafe { device.create_descriptor_pool(&cull_pool_info, None) }
+                .context("Failed to create cull descriptor pool")?;
+
+        let cull_layouts = vec![cull_set_layout; MAX_FRAMES_IN_FLIGHT];
+        let cull_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(cull_descriptor_pool)
+            .set_layouts(&cull_layouts);
+        // SAFETY: pool and layout are valid.
+        let cull_descriptor_sets =
+            unsafe { device.allocate_descriptor_sets(&cull_alloc) }
+                .context("Failed to allocate cull descriptor sets")?;
+
+        // Point each cull descriptor set at UBO, instance SSBO, mesh-info SSBO, draw buffer.
+        for (i, &set) in cull_descriptor_sets.iter().enumerate() {
+            let ubo_buf = resource_manager.get_buffer(ubo_buffers[i]);
+            let inst_buf = resource_manager.get_buffer(instance_ssbo_buffers[i]);
+            let draw_buf = resource_manager.get_buffer(cull_draw_buffers[i]);
+            let ubo_info  = [vk::DescriptorBufferInfo { buffer: ubo_buf,  offset: 0, range: ubo_size }];
+            let inst_info = [vk::DescriptorBufferInfo { buffer: inst_buf, offset: 0, range: instance_ssbo_size }];
+            let draw_info = [vk::DescriptorBufferInfo { buffer: draw_buf, offset: 0, range: draw_buf_size }];
+
+            // Mesh-info SSBO may not exist yet if scene has no meshes; use a dummy 4-byte buffer.
+            // We write the real one in build_scene_mega_buffers / reload_scene.
+            // For now write a placeholder that will be overwritten immediately.
+            let mesh_info_buf = mesh_info_ssbo
+                .map(|h| resource_manager.get_buffer(h))
+                .unwrap_or(ubo_buf); // safe placeholder (correct handle written below)
+            let mesh_info_range = if mesh_info_ssbo.is_some() {
+                (scene_data.meshes.len() * std::mem::size_of::<GpuMeshInfo>()).max(4) as u64
+            } else {
+                4
+            };
+            let minfo_info = [vk::DescriptorBufferInfo {
+                buffer: mesh_info_buf, offset: 0, range: mesh_info_range,
+            }];
+
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set).dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .buffer_info(&ubo_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set).dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&inst_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set).dst_binding(2)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&minfo_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set).dst_binding(3)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&draw_info),
+            ];
+            // SAFETY: set and all buffer handles are valid.
+            unsafe { device.update_descriptor_sets(&writes, &[]) };
+        }
+        log::info!("Cull compute pipeline + descriptor sets created");
 
         Ok(Self {
             entry,
@@ -1469,8 +2027,35 @@ impl VulkanContext {
             bloom_upsample_pipeline,
             composite_pipeline_layout,
             composite_pipeline,
+            depth_initial_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            ssao_sampler,
+            ssao_depth_view,
+            ssao_noise_image,
+            ssao_raw_image,
+            ssao_blurred_image,
+            ssao_set_layout,
+            ssao_blur_set_layout,
+            ssao_descriptor_pool,
+            ssao_descriptor_sets,
+            ssao_blur_descriptor_set,
+            ssao_ubo_buffers,
+            ssao_pipeline_layout,
+            ssao_pipeline,
+            ssao_blur_pipeline_layout,
+            ssao_blur_pipeline,
             egui_renderer: Some(egui_renderer),
             egui_textures_to_free: [Vec::new(), Vec::new()],
+            profiler,
+            mega_vertex_buffer,
+            mega_index_buffer,
+            mesh_info_ssbo,
+            instance_ssbo_buffers,
+            cull_draw_buffers,
+            cull_set_layout,
+            cull_descriptor_pool,
+            cull_descriptor_sets,
+            cull_pipeline_layout,
+            cull_pipeline,
         })
     }
 
@@ -1478,8 +2063,9 @@ impl VulkanContext {
         &mut self,
         window: &Window,
         view_proj: glam::Mat4,
+        proj: glam::Mat4,
         lighting_ubo: LightingUbo,
-        instances: &[(glam::Mat4, usize, usize)],
+        instances: &[DrawInstance],
         wireframe_lines: &[glam::Vec3],
         show_wireframe: bool,
         gizmo_verts: &[glam::Vec3],
@@ -1491,6 +2077,14 @@ impl VulkanContext {
         bloom_intensity: f32,
         bloom_threshold: f32,
         tone_aces: bool,
+        ssao_enabled: bool,
+        ssao_radius: f32,
+        ssao_bias: f32,
+        ssao_power: f32,
+        ssao_strength: f32,
+        ssao_sample_count: u32,
+        lod_distance_step: f32,
+        sky_tint: [f32; 4],
     ) -> Result<()> {
         let size = window.inner_size();
         if size.width == 0 || size.height == 0 {
@@ -1510,6 +2104,10 @@ impl VulkanContext {
             self.device
                 .wait_for_fences(&[self.in_flight_fences[self.current_frame]], true, u64::MAX)?;
         }
+
+        // GPU profiler: read timestamp/stats results from the previous use of this frame slot.
+        // The fence wait above guarantees the GPU has finished, so query results are ready.
+        self.profiler.read_results(&self.device, self.current_frame);
 
         // Free egui textures from the previous use of this frame slot (GPU is done with them).
         if let Some(ref mut renderer) = self.egui_renderer {
@@ -1559,6 +2157,43 @@ impl VulkanContext {
         let rm_ref = self.resource_manager.as_ref().expect("resource manager alive");
         rm_ref.write_buffer(self.ubo_buffers[self.current_frame], bytemuck::bytes_of(&lighting_ubo));
 
+        // Write instance SSBO for this frame.
+        // `instances` is pre-sorted by material_set_index by the caller.
+        let clamped_count = instances.len().min(MAX_INSTANCES);
+        {
+            let instance_gpu_data: Vec<InstanceData> = instances[..clamped_count]
+                .iter()
+                .map(|inst| InstanceData {
+                    model:      inst.model.to_cols_array_2d(),
+                    world_min:  [inst.world_min.x, inst.world_min.y, inst.world_min.z, 0.0],
+                    world_max:  [inst.world_max.x, inst.world_max.y, inst.world_max.z, 0.0],
+                    mesh_index: inst.mesh_index as u32,
+                    _pad:       [0; 3],
+                })
+                .collect();
+            if !instance_gpu_data.is_empty() {
+                rm_ref.write_buffer(
+                    self.instance_ssbo_buffers[self.current_frame],
+                    bytemuck::cast_slice(&instance_gpu_data),
+                );
+            }
+        }
+
+        // Build material groups from the sorted instance list.
+        let material_groups: Vec<MaterialGroup> = {
+            let mut groups: Vec<MaterialGroup> = Vec::new();
+            let mut i = 0u32;
+            while (i as usize) < clamped_count {
+                let mat = instances[i as usize].material_set_index;
+                let start = i;
+                while (i as usize) < clamped_count && instances[i as usize].material_set_index == mat {
+                    i += 1;
+                }
+                groups.push(MaterialGroup { material_set_index: mat, first_draw: start, draw_count: i - start });
+            }
+            groups
+        };
+
         // Upload wireframe vertices for this frame (CpuToGpu, already waited on fence).
         const WIREFRAME_BUF_BYTES: usize = 64 * 1024;
         let wireframe_vertex_count = if show_wireframe && !wireframe_lines.is_empty() {
@@ -1582,9 +2217,50 @@ impl VulkanContext {
         // Extract light_view_proj from the UBO (already computed by the caller).
         let light_view_proj = glam::Mat4::from_cols_array(&lighting_ubo.light_mvp);
 
+        // SSAO only works when MSAA is off (msaa_depth = None) — depth is single-sample.
+        let ssao_active = ssao_enabled && self.msaa_depth.is_none();
+
+        // Write SSAO UBO for this frame.
+        if ssao_active {
+            let w = self.swapchain_extent.width as f32;
+            let h = self.swapchain_extent.height as f32;
+            let ubo = SsaoUbo {
+                proj:         proj.to_cols_array(),
+                inv_proj:     proj.inverse().to_cols_array(),
+                kernel:       generate_ssao_kernel(),
+                radius:       ssao_radius,
+                bias:         ssao_bias,
+                power:        ssao_power,
+                sample_count: ssao_sample_count.min(32) as f32,
+                noise_scale:  [w / 4.0, h / 4.0],
+                _pad:         [0.0; 2],
+            };
+            let rm = self.resource_manager.as_ref().expect("resource manager alive");
+            rm.write_buffer(self.ssao_ubo_buffers[self.current_frame], bytemuck::bytes_of(&ubo));
+        }
+
         // Record command buffer.
         let cmd = self.command_buffers[self.current_frame];
-        self.record_command_buffer(cmd, image_index as usize, view_proj, light_view_proj, instances, wireframe_vertex_count, show_wireframe, has_gizmo, gizmo_groups, egui_primitives, egui_pixels_per_point, bloom_enabled, bloom_intensity, bloom_threshold, tone_aces)?;
+        self.record_command_buffer(
+            cmd, image_index as usize,
+            view_proj, light_view_proj,
+            instances, &material_groups, clamped_count as u32,
+            wireframe_vertex_count,
+            show_wireframe, has_gizmo, gizmo_groups,
+            egui_primitives, egui_pixels_per_point,
+            bloom_enabled, bloom_intensity, bloom_threshold,
+            tone_aces,
+            ssao_active, ssao_strength,
+            lod_distance_step,
+            sky_tint,
+        )?;
+
+        // Update depth_initial_layout for next frame based on whether SSAO ran.
+        self.depth_initial_layout = if ssao_active {
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        } else {
+            vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+        };
 
         // Submit.
         let wait_semaphores = [acquire_sem];
@@ -1645,7 +2321,9 @@ impl VulkanContext {
         image_index: usize,
         view_proj: glam::Mat4,
         light_view_proj: glam::Mat4,
-        instances: &[(glam::Mat4, usize, usize)],
+        instances: &[DrawInstance],
+        material_groups: &[MaterialGroup],
+        instance_count: u32,
         wireframe_vertex_count: u32,
         show_wireframe: bool,
         has_gizmo: bool,
@@ -1656,6 +2334,10 @@ impl VulkanContext {
         bloom_intensity: f32,
         bloom_threshold: f32,
         tone_aces: bool,
+        ssao_enabled: bool,
+        ssao_strength: f32,
+        lod_distance_step: f32,
+        sky_tint: [f32; 4],
     ) -> Result<()> {
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -1665,6 +2347,11 @@ impl VulkanContext {
             self.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
             self.device.begin_command_buffer(cmd, &begin_info)?;
         }
+
+        // GPU profiler: reset query pools for this frame slot (GPU-side reset via cmd).
+        let frame_idx = self.current_frame;
+        // SAFETY: cmd is recording; profiler pools are valid.
+        self.profiler.begin_frame(&self.device, cmd, frame_idx);
 
         // -----------------------------------------------------------------------
         // Build the render graph for this frame.
@@ -1703,16 +2390,40 @@ impl VulkanContext {
             graph.add_resource(
                 rm.get_image_raw(h),
                 vk::ImageAspectFlags::COLOR,
-                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             )
         });
         let r_msaa_depth = self.msaa_depth.map(|h| {
             graph.add_resource(
                 rm.get_image_raw(h),
                 depth_aspect(self.depth_format),
-                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
             )
         });
+        // Single-sample depth (used as attachment when MSAA=off, sampled by SSAO).
+        // Tracked across frames via self.depth_initial_layout so barriers are correct
+        // whether SSAO was on or off the previous frame.
+        let r_depth = if self.msaa_depth.is_none() {
+            Some(graph.add_resource(
+                rm.get_image_raw(self.depth_image),
+                vk::ImageAspectFlags::DEPTH, // depth-only for barrier subresource range
+                self.depth_initial_layout,
+            ))
+        } else {
+            None
+        };
+        // SSAO AO images — always start in SHADER_READ_ONLY (initialised at creation,
+        // and bloom_overwrite transitions them back to SHADER_READ_ONLY after each frame).
+        let r_ssao_raw = graph.add_resource(
+            rm.get_image_raw(self.ssao_raw_image),
+            vk::ImageAspectFlags::COLOR,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        );
+        let r_ssao_blurred = graph.add_resource(
+            rm.get_image_raw(self.ssao_blurred_image),
+            vk::ImageAspectFlags::COLOR,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        );
 
         // --- Frame-init pseudo-pass: UNDEFINED → COLOR_ATTACHMENT / DEPTH_STENCIL ---
         {
@@ -1725,41 +2436,67 @@ impl VulkanContext {
                 init_accesses.push((rc, ResourceAccess::color_init()));
             }
             if let Some(rd) = r_msaa_depth {
-                // MSAA depth: UNDEFINED → DEPTH_STENCIL. Use a plain depth subresource
-                // (the graph uses the aspect stored on the resource).
                 init_accesses.push((rd, ResourceAccess::depth_init()));
             }
             graph.add_pass("FrameInit", &init_accesses);
         }
+
+        // --- GPU cull pass (compute): builds indirect draw buffer from instance SSBO ---
+        // No image resources. Buffer barrier (compute write → indirect read) is declared on
+        // the following Main+Skybox pass so it is emitted at the right boundary.
+        graph.add_pass("CullPass", &[]);
 
         // --- Shadow pass ---
         graph.add_pass("Shadow", &[(r_shadow, ResourceAccess::shadow_write())]);
 
         // --- Main + Skybox pass ---
         // Renders to hdr_color (or msaa_color if MSAA, which resolves to hdr_color).
-        // After the pass, hdr_color transitions to SHADER_READ_ONLY for bloom/composite.
+        // Also writes single-sample depth (transitioning to SHADER_READ_ONLY if SSAO active).
         {
-            if let Some(rc) = r_msaa_color {
-                // MSAA: msaa_color is the render target, hdr_color is the resolve target.
-                // Both need COLOR_ATTACHMENT during the pass; hdr_color transitions to
-                // SHADER_READ_ONLY after (msaa_color stays COLOR_ATTACHMENT, not sampled).
-                graph.add_pass(
-                    "Main+Skybox",
-                    &[
-                        (rc,    ResourceAccess::color_attachment()),
-                        (r_hdr, ResourceAccess::color_attachment_to_read()),
-                        (r_shadow, ResourceAccess::shader_read()),
-                    ],
-                );
+            let depth_access = if ssao_enabled {
+                ResourceAccess::depth_attachment_to_shader_read()
             } else {
-                graph.add_pass(
+                ResourceAccess::depth_attachment()
+            };
+
+            // Buffer barrier: cull compute SHADER_WRITE → INDIRECT_COMMAND_READ.
+            let cull_buf = rm.get_buffer(self.cull_draw_buffers[self.current_frame]);
+            let cull_barrier = BufferBarrier {
+                buffer:     cull_buf,
+                src_access: vk::AccessFlags::SHADER_WRITE,
+                dst_access: vk::AccessFlags::INDIRECT_COMMAND_READ,
+                src_stage:  vk::PipelineStageFlags::COMPUTE_SHADER,
+                dst_stage:  vk::PipelineStageFlags::DRAW_INDIRECT,
+            };
+
+            if let Some(rc) = r_msaa_color {
+                let accesses = vec![
+                    (rc,    ResourceAccess::color_attachment()),
+                    (r_hdr, ResourceAccess::color_attachment_to_read()),
+                    (r_shadow, ResourceAccess::shader_read()),
+                ];
+                // depth_image not used in MSAA mode (msaa_depth is the real depth buffer).
+                graph.add_pass_with_buffers("Main+Skybox", &accesses, &[cull_barrier]);
+                let _ = depth_access; // suppress unused warning
+            } else {
+                graph.add_pass_with_buffers(
                     "Main+Skybox",
                     &[
                         (r_hdr, ResourceAccess::color_attachment_to_read()),
                         (r_shadow, ResourceAccess::shader_read()),
+                        (r_depth.unwrap(), depth_access),
                     ],
+                    &[cull_barrier],
                 );
             }
+        }
+
+        // --- SSAO passes (conditional, non-MSAA only) ---
+        if ssao_enabled {
+            // SSAOPass: reads depth (now SHADER_READ_ONLY) + noise, writes ssao_raw.
+            graph.add_pass("SSAOPass", &[(r_ssao_raw, ResourceAccess::bloom_overwrite())]);
+            // SSAOBlurPass: reads ssao_raw (SHADER_READ_ONLY), writes ssao_blurred.
+            graph.add_pass("SSAOBlur", &[(r_ssao_blurred, ResourceAccess::bloom_overwrite())]);
         }
 
         // --- Bloom passes (conditional) ---
@@ -1822,9 +2559,54 @@ impl VulkanContext {
         graph.end_pass(&self.device, cmd);
 
         // -----------------------------------------------------------------------
+        // CullPass: compute shader frustum culling → indirect draw buffer.
+        // No rendering attachment; the buffer barrier (SHADER_WRITE → INDIRECT_READ)
+        // is emitted at the start of the next pass (Main+Skybox).
+        // -----------------------------------------------------------------------
+        graph.begin_pass(&self.device, cmd);
+        self.profiler.begin_pass(&self.device, cmd, frame_idx, "CullPass");
+        // SAFETY: cmd is recording; cull pipeline/layout/descriptor sets are valid.
+        unsafe {
+            self.device.cmd_bind_pipeline(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.cull_pipeline,
+            );
+            self.device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.cull_pipeline_layout,
+                0,
+                &[self.cull_descriptor_sets[self.current_frame]],
+                &[],
+            );
+            // Push constant: {instance_count, lod_distance_step} (8 bytes).
+            // lod_distance_step = 0.0 disables LOD (all instances use LOD 0).
+            #[repr(C)]
+            #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+            struct CullPc { instance_count: u32, lod_distance_step: f32 }
+            let cull_pc = CullPc { instance_count, lod_distance_step };
+            self.device.cmd_push_constants(
+                cmd,
+                self.cull_pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                bytemuck::bytes_of(&cull_pc),
+            );
+            // Dispatch one workgroup per 64 instances (local_size_x = 64 in cull.comp).
+            let groups = instance_count.div_ceil(64).max(1);
+            self.device.cmd_dispatch(cmd, groups, 1, 1);
+        }
+        self.profiler.end_pass(&self.device, cmd, frame_idx);
+        graph.end_pass(&self.device, cmd);
+
+        // -----------------------------------------------------------------------
         // Shadow pass
         // -----------------------------------------------------------------------
         graph.begin_pass(&self.device, cmd);
+        self.profiler.begin_pass(&self.device, cmd, frame_idx, "Shadow");
+        // Pipeline stats encompass all draw passes (Shadow through Composite).
+        self.profiler.begin_stats(&self.device, cmd, frame_idx);
 
         let shadow_depth_att = vk::RenderingAttachmentInfo::default()
             .image_view(rm.get_image_view(self.shadow_map))
@@ -1871,44 +2653,48 @@ impl VulkanContext {
                 self.shadow_pipeline,
             );
 
-            for (model, mesh_idx, _mat_idx) in instances {
-                let mesh = &self.gpu_meshes[*mesh_idx];
-                // Push constant: full MVP from light's perspective = light_view_proj * model.
-                let light_mvp: glam::Mat4 = light_view_proj * *model;
-                // SAFETY: Mat4 is Pod, 64 bytes; layout has this range.
-                self.device.cmd_push_constants(
-                    cmd,
-                    self.shadow_pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX,
-                    0,
-                    bytemuck::bytes_of(&light_mvp),
-                );
+            // Bind mega vertex/index buffers once for all shadow draws.
+            if let (Some(mvb), Some(mib)) = (self.mega_vertex_buffer, self.mega_index_buffer) {
+                self.device.cmd_bind_vertex_buffers(cmd, 0, &[rm.get_buffer(mvb)], &[0]);
+                self.device.cmd_bind_index_buffer(cmd, rm.get_buffer(mib), 0, vk::IndexType::UINT32);
 
-                self.device.cmd_bind_vertex_buffers(
-                    cmd,
-                    0,
-                    &[rm.get_buffer(mesh.vertex_buffer)],
-                    &[0],
-                );
-                self.device.cmd_bind_index_buffer(
-                    cmd,
-                    rm.get_buffer(mesh.index_buffer),
-                    0,
-                    vk::IndexType::UINT32,
-                );
-                self.device.cmd_draw_indexed(cmd, mesh.index_count, 1, 0, 0, 0);
+                for inst in &instances[..instance_count as usize] {
+                    let mesh = &self.gpu_meshes[inst.mesh_index];
+                    // Shadow always uses LOD 0 (full detail) for correct shadow silhouettes.
+                    let lod0 = mesh.lods[0];
+                    // Push constant: full MVP from light's perspective = light_view_proj * model.
+                    let light_mvp: glam::Mat4 = light_view_proj * inst.model;
+                    // SAFETY: Mat4 is Pod, 64 bytes; shadow layout has this range.
+                    self.device.cmd_push_constants(
+                        cmd,
+                        self.shadow_pipeline_layout,
+                        vk::ShaderStageFlags::VERTEX,
+                        0,
+                        bytemuck::bytes_of(&light_mvp),
+                    );
+                    self.device.cmd_draw_indexed(
+                        cmd,
+                        lod0.index_count,
+                        1,
+                        lod0.first_index,
+                        mesh.vertex_offset,
+                        0,
+                    );
+                }
             }
 
             self.dynamic_rendering_loader.cmd_end_rendering(cmd);
         }
 
         // end_pass emits the exit barrier: DEPTH_STENCIL → SHADER_READ_ONLY.
+        self.profiler.end_pass(&self.device, cmd, frame_idx);
         graph.end_pass(&self.device, cmd);
 
         // -----------------------------------------------------------------------
         // Main pass (PBR meshes + skybox)
         // -----------------------------------------------------------------------
         graph.begin_pass(&self.device, cmd);
+        self.profiler.begin_pass(&self.device, cmd, frame_idx, "Main+Skybox");
 
         let clear_color = vk::ClearValue {
             color: vk::ClearColorValue { float32: [0.01, 0.01, 0.05, 1.0] },
@@ -1947,12 +2733,17 @@ impl VulkanContext {
                 .store_op(vk::AttachmentStoreOp::DONT_CARE)
                 .clear_value(clear_depth)
         } else {
-            // No MSAA: regular depth buffer.
+            // No MSAA: regular depth buffer. Store if SSAO will sample it.
+            let depth_store_op = if ssao_enabled {
+                vk::AttachmentStoreOp::STORE
+            } else {
+                vk::AttachmentStoreOp::DONT_CARE
+            };
             vk::RenderingAttachmentInfo::default()
                 .image_view(rm.get_image_view(self.depth_image))
                 .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
                 .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .store_op(depth_store_op)
                 .clear_value(clear_depth)
         };
 
@@ -2005,45 +2796,37 @@ impl VulkanContext {
                 &[],
             );
 
-            for (model, mesh_idx, mat_set_idx) in instances {
-                let mesh = &self.gpu_meshes[*mesh_idx];
-                let material_set = self.material_sets[*mat_set_idx];
+            // GPU-driven: bind mega buffers once, then issue one indirect draw per material group.
+            if let (Some(mvb), Some(mib)) = (self.mega_vertex_buffer, self.mega_index_buffer) {
+                self.device.cmd_bind_vertex_buffers(cmd, 0, &[rm.get_buffer(mvb)], &[0]);
+                self.device.cmd_bind_index_buffer(cmd, rm.get_buffer(mib), 0, vk::IndexType::UINT32);
 
-                // Bind per-material textures (set 1).
-                self.device.cmd_bind_descriptor_sets(
-                    cmd,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.pipeline_layout,
-                    1,
-                    &[material_set],
-                    &[],
-                );
+                let cull_buf = rm.get_buffer(self.cull_draw_buffers[self.current_frame]);
+                let stride = std::mem::size_of::<DrawIndirectCommand>() as u32;
 
-                let mvp = view_proj * *model;
-                let pc = MeshPushConstants { mvp, model: *model };
-                // SAFETY: MeshPushConstants is Pod, 128 bytes; layout has this range.
-                self.device.cmd_push_constants(
-                    cmd,
-                    self.pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX,
-                    0,
-                    bytemuck::bytes_of(&pc),
-                );
-
-                self.device.cmd_bind_vertex_buffers(
-                    cmd,
-                    0,
-                    &[rm.get_buffer(mesh.vertex_buffer)],
-                    &[0],
-                );
-                self.device.cmd_bind_index_buffer(
-                    cmd,
-                    rm.get_buffer(mesh.index_buffer),
-                    0,
-                    vk::IndexType::UINT32,
-                );
-                // SAFETY: index_count matches what was uploaded; no index buffer overflow.
-                self.device.cmd_draw_indexed(cmd, mesh.index_count, 1, 0, 0, 0);
+                for group in material_groups {
+                    let material_set = self.material_sets[group.material_set_index];
+                    // Bind per-material textures (set 1).
+                    self.device.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.pipeline_layout,
+                        1,
+                        &[material_set],
+                        &[],
+                    );
+                    // Each entry in the indirect buffer corresponds to one instance draw.
+                    // The compute shader filled in index_count/vertex_offset from mesh_info;
+                    // first_instance == the original instance index → gl_BaseInstance in the shader.
+                    //
+                    // MoltenVK / macOS does not support multiDrawIndirect, so drawCount must be 1.
+                    // Loop over each draw in the group individually — correct everywhere.
+                    // SAFETY: cull_buf is valid; each offset is within the allocated range.
+                    for draw_idx in 0..group.draw_count {
+                        let offset = ((group.first_draw + draw_idx) as u64) * (stride as u64);
+                        self.device.cmd_draw_indexed_indirect(cmd, cull_buf, offset, 1, stride);
+                    }
+                }
             }
 
             // Skybox: fullscreen triangle at depth=1.0.
@@ -2058,7 +2841,7 @@ impl VulkanContext {
                 &[],
             );
             let inv_view_proj = view_proj.inverse();
-            // SAFETY: Mat4 is Pod, 64 bytes; layout has a 64-byte VERTEX push constant.
+            // SAFETY: Mat4 is Pod, 64 bytes; layout has a 64-byte VERTEX push constant range.
             self.device.cmd_push_constants(
                 cmd,
                 self.skybox_pipeline_layout,
@@ -2066,13 +2849,117 @@ impl VulkanContext {
                 0,
                 bytemuck::bytes_of(&inv_view_proj),
             );
+            // SAFETY: [f32;4] is Pod, 16 bytes; layout has a 16-byte FRAGMENT push constant at offset 64.
+            self.device.cmd_push_constants(
+                cmd,
+                self.skybox_pipeline_layout,
+                vk::ShaderStageFlags::FRAGMENT,
+                64,
+                bytemuck::bytes_of(&sky_tint),
+            );
             // 3 vertices, no vertex buffer — positions generated from gl_VertexIndex.
             self.device.cmd_draw(cmd, 3, 1, 0, 0);
 
             self.dynamic_rendering_loader.cmd_end_rendering(cmd);
         }
 
+        self.profiler.end_pass(&self.device, cmd, frame_idx);
         graph.end_pass(&self.device, cmd);
+
+        // -----------------------------------------------------------------------
+        // SSAO passes (conditional, non-MSAA only)
+        // -----------------------------------------------------------------------
+        if ssao_enabled {
+            let ext = self.swapchain_extent;
+
+            // --- SSAOPass: depth + noise → raw AO ---
+            graph.begin_pass(&self.device, cmd);
+            self.profiler.begin_pass(&self.device, cmd, frame_idx, "SSAO");
+            {
+                let ssao_color_att = vk::RenderingAttachmentInfo::default()
+                    .image_view(rm.get_image_view(self.ssao_raw_image))
+                    .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .load_op(vk::AttachmentLoadOp::DONT_CARE)
+                    .store_op(vk::AttachmentStoreOp::STORE);
+                let ssao_rendering_info = vk::RenderingInfo::default()
+                    .render_area(vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: ext })
+                    .layer_count(1)
+                    .color_attachments(std::slice::from_ref(&ssao_color_att));
+
+                // SAFETY: cmd is recording; all referenced handles are valid.
+                unsafe {
+                    self.dynamic_rendering_loader.cmd_begin_rendering(cmd, &ssao_rendering_info);
+
+                    let viewports = [vk::Viewport {
+                        x: 0.0, y: 0.0,
+                        width: ext.width as f32, height: ext.height as f32,
+                        min_depth: 0.0, max_depth: 1.0,
+                    }];
+                    self.device.cmd_set_viewport(cmd, 0, &viewports);
+                    let scissors = [vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: ext }];
+                    self.device.cmd_set_scissor(cmd, 0, &scissors);
+
+                    self.device.cmd_bind_pipeline(
+                        cmd, vk::PipelineBindPoint::GRAPHICS, self.ssao_pipeline,
+                    );
+                    self.device.cmd_bind_descriptor_sets(
+                        cmd, vk::PipelineBindPoint::GRAPHICS,
+                        self.ssao_pipeline_layout, 0,
+                        &[self.ssao_descriptor_sets[self.current_frame]], &[],
+                    );
+                    // Fullscreen triangle — no vertex buffer.
+                    self.device.cmd_draw(cmd, 3, 1, 0, 0);
+
+                    self.dynamic_rendering_loader.cmd_end_rendering(cmd);
+                }
+            }
+            self.profiler.end_pass(&self.device, cmd, frame_idx);
+            graph.end_pass(&self.device, cmd);
+
+            // --- SSAOBlur: raw AO → blurred AO ---
+            graph.begin_pass(&self.device, cmd);
+            self.profiler.begin_pass(&self.device, cmd, frame_idx, "SSAOBlur");
+            {
+                let blur_color_att = vk::RenderingAttachmentInfo::default()
+                    .image_view(rm.get_image_view(self.ssao_blurred_image))
+                    .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .load_op(vk::AttachmentLoadOp::DONT_CARE)
+                    .store_op(vk::AttachmentStoreOp::STORE);
+                let blur_rendering_info = vk::RenderingInfo::default()
+                    .render_area(vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: ext })
+                    .layer_count(1)
+                    .color_attachments(std::slice::from_ref(&blur_color_att));
+
+                // SAFETY: cmd is recording; all referenced handles are valid.
+                unsafe {
+                    self.dynamic_rendering_loader.cmd_begin_rendering(cmd, &blur_rendering_info);
+
+                    let viewports = [vk::Viewport {
+                        x: 0.0, y: 0.0,
+                        width: ext.width as f32, height: ext.height as f32,
+                        min_depth: 0.0, max_depth: 1.0,
+                    }];
+                    self.device.cmd_set_viewport(cmd, 0, &viewports);
+                    let scissors = [vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: ext }];
+                    self.device.cmd_set_scissor(cmd, 0, &scissors);
+
+                    self.device.cmd_bind_pipeline(
+                        cmd, vk::PipelineBindPoint::GRAPHICS, self.ssao_blur_pipeline,
+                    );
+                    self.device.cmd_bind_descriptor_sets(
+                        cmd, vk::PipelineBindPoint::GRAPHICS,
+                        self.ssao_blur_pipeline_layout, 0,
+                        &[self.ssao_blur_descriptor_set], &[],
+                    );
+                    // Fullscreen triangle — no vertex buffer.
+                    self.device.cmd_draw(cmd, 3, 1, 0, 0);
+
+                    self.dynamic_rendering_loader.cmd_end_rendering(cmd);
+                }
+            }
+            self.profiler.end_pass(&self.device, cmd, frame_idx);
+            graph.end_pass(&self.device, cmd);
+        }
 
         // -----------------------------------------------------------------------
         // Bloom passes (conditional)
@@ -2091,6 +2978,11 @@ impl VulkanContext {
             // --- Downsample passes ---
             for i in 0..BLOOM_LEVELS {
                 graph.begin_pass(&self.device, cmd);
+                let bloom_down_name: &'static str = match i {
+                    0 => "BloomDown0", 1 => "BloomDown1", 2 => "BloomDown2",
+                    3 => "BloomDown3", _ => "BloomDown4",
+                };
+                self.profiler.begin_pass(&self.device, cmd, frame_idx, bloom_down_name);
 
                 let ext = self.bloom_extents[i];
                 let bloom_color_att = vk::RenderingAttachmentInfo::default()
@@ -2152,12 +3044,17 @@ impl VulkanContext {
                     self.dynamic_rendering_loader.cmd_end_rendering(cmd);
                 }
 
+                self.profiler.end_pass(&self.device, cmd, frame_idx);
                 graph.end_pass(&self.device, cmd);
             }
 
             // --- Upsample passes (BLOOM_LEVELS-2 down to 0) ---
             for i in (0..(BLOOM_LEVELS - 1)).rev() {
                 graph.begin_pass(&self.device, cmd);
+                let bloom_up_name: &'static str = match i {
+                    0 => "BloomUp0", 1 => "BloomUp1", 2 => "BloomUp2", _ => "BloomUp3",
+                };
+                self.profiler.begin_pass(&self.device, cmd, frame_idx, bloom_up_name);
 
                 let ext = self.bloom_extents[i];
                 let bloom_color_att = vk::RenderingAttachmentInfo::default()
@@ -2214,6 +3111,7 @@ impl VulkanContext {
                     self.dynamic_rendering_loader.cmd_end_rendering(cmd);
                 }
 
+                self.profiler.end_pass(&self.device, cmd, frame_idx);
                 graph.end_pass(&self.device, cmd);
             }
         }
@@ -2222,6 +3120,7 @@ impl VulkanContext {
         // Composite pass: tone-map hdr_color + bloom → swapchain
         // -----------------------------------------------------------------------
         graph.begin_pass(&self.device, cmd);
+        self.profiler.begin_pass(&self.device, cmd, frame_idx, "Composite");
         {
             let comp_color_att = vk::RenderingAttachmentInfo::default()
                 .image_view(self.swapchain_image_views[image_index])
@@ -2242,13 +3141,15 @@ impl VulkanContext {
                 bloom_intensity: f32,
                 tone_mode: f32,      // 0 = Reinhard, 1 = ACES
                 bloom_enabled: f32,
-                _pad: f32,
+                ssao_strength: f32,  // 0 = off, 1 = full AO
             }
+            // When SSAO is disabled (MSAA on, or toggled off), pass 0 → no darkening.
+            let effective_ssao_strength = if ssao_enabled { ssao_strength } else { 0.0 };
             let comp_pc = CompositePc {
                 bloom_intensity,
                 tone_mode: if tone_aces { 1.0 } else { 0.0 },
                 bloom_enabled: if bloom_enabled { 1.0 } else { 0.0 },
-                _pad: 0.0,
+                ssao_strength: effective_ssao_strength,
             };
 
             // SAFETY: cmd is recording; all referenced handles are valid.
@@ -2289,6 +3190,9 @@ impl VulkanContext {
                 self.dynamic_rendering_loader.cmd_end_rendering(cmd);
             }
         }
+        self.profiler.end_pass(&self.device, cmd, frame_idx);
+        // End pipeline stats — encompassed Shadow through Composite.
+        self.profiler.end_stats(&self.device, cmd, frame_idx);
         graph.end_pass(&self.device, cmd);
 
         // -----------------------------------------------------------------------
@@ -2296,6 +3200,7 @@ impl VulkanContext {
         // -----------------------------------------------------------------------
         if show_wireframe && wireframe_vertex_count > 0 {
             graph.begin_pass(&self.device, cmd);
+            self.profiler.begin_pass(&self.device, cmd, frame_idx, "Wireframe");
 
             let wf_color_att = vk::RenderingAttachmentInfo::default()
                 .image_view(self.swapchain_image_views[image_index])
@@ -2362,6 +3267,7 @@ impl VulkanContext {
                 self.dynamic_rendering_loader.cmd_end_rendering(cmd);
             }
 
+            self.profiler.end_pass(&self.device, cmd, frame_idx);
             graph.end_pass(&self.device, cmd);
         }
 
@@ -2370,6 +3276,7 @@ impl VulkanContext {
         // -----------------------------------------------------------------------
         if has_gizmo && !gizmo_groups.is_empty() {
             graph.begin_pass(&self.device, cmd);
+            self.profiler.begin_pass(&self.device, cmd, frame_idx, "Gizmo");
 
             let gizmo_color_att = vk::RenderingAttachmentInfo::default()
                 .image_view(self.swapchain_image_views[image_index])
@@ -2414,6 +3321,7 @@ impl VulkanContext {
                 }
                 self.dynamic_rendering_loader.cmd_end_rendering(cmd);
             }
+            self.profiler.end_pass(&self.device, cmd, frame_idx);
             graph.end_pass(&self.device, cmd);
         }
 
@@ -2422,6 +3330,7 @@ impl VulkanContext {
         // -----------------------------------------------------------------------
         if !egui_primitives.is_empty() {
             graph.begin_pass(&self.device, cmd);
+            self.profiler.begin_pass(&self.device, cmd, frame_idx, "Egui");
 
             let egui_color_att = vk::RenderingAttachmentInfo::default()
                 .image_view(self.swapchain_image_views[image_index])
@@ -2453,6 +3362,7 @@ impl VulkanContext {
                 self.dynamic_rendering_loader.cmd_end_rendering(cmd);
             }
 
+            self.profiler.end_pass(&self.device, cmd, frame_idx);
             graph.end_pass(&self.device, cmd);
         }
 
@@ -2540,6 +3450,11 @@ impl VulkanContext {
     /// Replace all scene-specific GPU resources (meshes, textures, material descriptor sets)
     /// with the contents of `scene_data`. The swap is atomic from the CPU perspective:
     /// `vkDeviceWaitIdle` ensures no in-flight commands reference the old resources.
+    /// Read-only access to the GPU profiler results (updated each frame after fence wait).
+    pub fn gpu_profiler(&self) -> &super::gpu_profiler::GpuProfiler {
+        &self.profiler
+    }
+
     ///
     /// After this call, `MeshRenderer.mesh_index` and `material_set_index` from the new
     /// ECS world reference the updated global arrays.
@@ -2550,9 +3465,12 @@ impl VulkanContext {
         // --- Free old scene meshes and textures ---
         {
             let rm = self.resource_manager.as_mut().context("resource manager unavailable")?;
-            for mesh in self.gpu_meshes.drain(..) {
-                rm.destroy_mesh(mesh);
-            }
+            // GpuMesh is now an offset descriptor (no per-mesh GPU resources); just clear the vec.
+            self.gpu_meshes.clear();
+            // Destroy old mega buffers; new ones will be built below.
+            if let Some(h) = self.mega_vertex_buffer.take() { rm.destroy_buffer(h); }
+            if let Some(h) = self.mega_index_buffer.take()  { rm.destroy_buffer(h); }
+            if let Some(h) = self.mesh_info_ssbo.take()     { rm.destroy_buffer(h); }
             for &tex in &self.scene_textures {
                 rm.destroy_image(tex);
             }
@@ -2632,11 +3550,35 @@ impl VulkanContext {
             );
         }
 
-        // --- Upload new meshes ---
+        // --- Build new mega buffers and mesh descriptors ---
         {
             let rm = self.resource_manager.as_mut().context("resource manager unavailable")?;
-            for data in &scene_data.meshes {
-                self.gpu_meshes.push(rm.upload_mesh(&data.vertices, &data.indices)?);
+            let (gpu_meshes, mega_vb, mega_ib, mesh_info) =
+                build_scene_mega_buffers(rm, &scene_data.meshes)?;
+            self.gpu_meshes = gpu_meshes;
+            self.mega_vertex_buffer = mega_vb;
+            self.mega_index_buffer  = mega_ib;
+            self.mesh_info_ssbo     = mesh_info;
+        }
+
+        // Update cull descriptor sets binding 2 to point to the new mesh_info_ssbo.
+        if let Some(mesh_ssbo) = self.mesh_info_ssbo {
+            let rm = self.resource_manager.as_ref().context("resource manager unavailable")?;
+            let mesh_buf = rm.get_buffer(mesh_ssbo);
+            let mesh_range = (scene_data.meshes.len() * std::mem::size_of::<GpuMeshInfo>()).max(4) as u64;
+            for &set in &self.cull_descriptor_sets {
+                let mesh_info_buf_info = [vk::DescriptorBufferInfo {
+                    buffer: mesh_buf,
+                    offset: 0,
+                    range:  mesh_range,
+                }];
+                let write = vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(2)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&mesh_info_buf_info);
+                // SAFETY: device is idle, descriptor set is valid.
+                unsafe { self.device.update_descriptor_sets(&[write], &[]); }
             }
         }
 
@@ -2773,11 +3715,13 @@ impl VulkanContext {
         // Recreate depth buffer + MSAA images + HDR color + bloom at the new size.
         if let Some(ref mut rm) = self.resource_manager {
             rm.destroy_image(self.depth_image);
+            // SAFETY: ssao_depth_view is valid; destroy before recreating depth.
+            unsafe { self.device.destroy_image_view(self.ssao_depth_view, None) };
             self.depth_image = rm.create_attachment_image(
                 extent.width,
                 extent.height,
                 self.depth_format,
-                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
                 depth_aspect(self.depth_format),
                 vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                 vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
@@ -2785,6 +3729,21 @@ impl VulkanContext {
                 vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
                     | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
             )?;
+            // Recreate depth-only view for SSAO sampling.
+            let depth_view_ci = vk::ImageViewCreateInfo::default()
+                .image(rm.get_image_raw(self.depth_image))
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(self.depth_format)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::DEPTH,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            // SAFETY: image is freshly created and valid.
+            self.ssao_depth_view = unsafe { self.device.create_image_view(&depth_view_ci, None)? };
+            self.depth_initial_layout = vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
             // Recreate MSAA images if active.
             if let Some(h) = self.msaa_color.take() { rm.destroy_image(h); }
@@ -2875,6 +3834,73 @@ impl VulkanContext {
                 // SAFETY: set, image view, and sampler are valid.
                 unsafe { self.device.update_descriptor_sets(&write, &[]) };
             }
+            // Recreate SSAO full-res images.
+            rm.destroy_image(self.ssao_raw_image);
+            rm.destroy_image(self.ssao_blurred_image);
+            self.ssao_raw_image = rm.create_attachment_image(
+                extent.width, extent.height,
+                vk::Format::R8_UNORM,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                vk::ImageAspectFlags::COLOR,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::AccessFlags::SHADER_READ,
+            )?;
+            self.ssao_blurred_image = rm.create_attachment_image(
+                extent.width, extent.height,
+                vk::Format::R8_UNORM,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                vk::ImageAspectFlags::COLOR,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::AccessFlags::SHADER_READ,
+            )?;
+            // Re-point SSAO descriptor sets at new depth view + new images.
+            for (i, &set) in self.ssao_descriptor_sets.iter().enumerate() {
+                let depth_info = [vk::DescriptorImageInfo {
+                    sampler: self.ssao_sampler,
+                    image_view: self.ssao_depth_view,
+                    image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                }];
+                let noise_info = [vk::DescriptorImageInfo {
+                    sampler: self.ssao_sampler,
+                    image_view: rm.get_image_view(self.ssao_noise_image),
+                    image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                }];
+                let ubo_info = [vk::DescriptorBufferInfo {
+                    buffer: rm.get_buffer(self.ssao_ubo_buffers[i]),
+                    offset: 0,
+                    range: std::mem::size_of::<SsaoUbo>() as u64,
+                }];
+                let writes = [
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set).dst_binding(0)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(&depth_info),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set).dst_binding(1)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(&noise_info),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set).dst_binding(2)
+                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                        .buffer_info(&ubo_info),
+                ];
+                // SAFETY: set and image views are valid.
+                unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+            }
+            let ssao_raw_info = [vk::DescriptorImageInfo {
+                sampler: self.ssao_sampler,
+                image_view: rm.get_image_view(self.ssao_raw_image),
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            }];
+            let blur_write = [vk::WriteDescriptorSet::default()
+                .dst_set(self.ssao_blur_descriptor_set).dst_binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&ssao_raw_info)];
+            // SAFETY: set and image view are valid.
+            unsafe { self.device.update_descriptor_sets(&blur_write, &[]) };
+
             // Composite: binding 0 = hdr_color, binding 1 = bloom_images[0]
             let hdr_img_info = [vk::DescriptorImageInfo {
                 sampler: self.bloom_sampler,
@@ -2900,6 +3926,20 @@ impl VulkanContext {
             ];
             // SAFETY: set, image views, and sampler are valid.
             unsafe { self.device.update_descriptor_sets(&comp_writes, &[]) };
+
+            // Update composite binding 2 = ssao_blurred.
+            let ssao_blurred_info = [vk::DescriptorImageInfo {
+                sampler: self.ssao_sampler,
+                image_view: rm.get_image_view(self.ssao_blurred_image),
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            }];
+            let ssao_comp_write = [vk::WriteDescriptorSet::default()
+                .dst_set(self.composite_descriptor_set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&ssao_blurred_info)];
+            // SAFETY: set and image view are valid.
+            unsafe { self.device.update_descriptor_sets(&ssao_comp_write, &[]) };
         }
 
         // Recreate semaphores for new image count.
@@ -2968,9 +4008,9 @@ impl VulkanContext {
                 for &buf in &self.ubo_buffers {
                     rm.destroy_buffer(buf);
                 }
-                for mesh in self.gpu_meshes.drain(..) {
-                    rm.destroy_mesh(mesh);
-                }
+                // GpuMesh is now an offset descriptor (no per-mesh GPU resources).
+                // Mega vertex/index buffers and mesh_info_ssbo are destroyed by destroy_all() below.
+                self.gpu_meshes.clear();
                 for &tex in &self.scene_textures {
                     rm.destroy_image(tex);
                 }
@@ -3022,6 +4062,26 @@ impl VulkanContext {
             // egui renderer (must be before device destruction)
             drop(self.egui_renderer.take());
 
+            // GPU profiler query pools
+            self.profiler.destroy(&self.device);
+
+            // SSAO resources
+            self.device.destroy_pipeline(self.ssao_blur_pipeline, None);
+            self.device.destroy_pipeline_layout(self.ssao_blur_pipeline_layout, None);
+            self.device.destroy_pipeline(self.ssao_pipeline, None);
+            self.device.destroy_pipeline_layout(self.ssao_pipeline_layout, None);
+            self.device.destroy_descriptor_pool(self.ssao_descriptor_pool, None);
+            self.device.destroy_descriptor_set_layout(self.ssao_blur_set_layout, None);
+            self.device.destroy_descriptor_set_layout(self.ssao_set_layout, None);
+            self.device.destroy_image_view(self.ssao_depth_view, None);
+            self.device.destroy_sampler(self.ssao_sampler, None);
+            if let Some(rm) = self.resource_manager.as_mut() {
+                rm.destroy_image(self.ssao_blurred_image);
+                rm.destroy_image(self.ssao_raw_image);
+                rm.destroy_image(self.ssao_noise_image);
+                for h in self.ssao_ubo_buffers.drain(..) { rm.destroy_buffer(h); }
+            }
+
             // Pipelines + layouts (before swapchain, reverse creation order)
             self.device.destroy_pipeline(self.composite_pipeline, None);
             self.device.destroy_pipeline_layout(self.composite_pipeline_layout, None);
@@ -3041,6 +4101,13 @@ impl VulkanContext {
                 .destroy_pipeline(self.shadow_pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.shadow_pipeline_layout, None);
+
+            // Cull compute pipeline (Fase 23/24 GPU-driven rendering).
+            // Pool destruction frees all allocated descriptor sets implicitly.
+            self.device.destroy_pipeline(self.cull_pipeline, None);
+            self.device.destroy_pipeline_layout(self.cull_pipeline_layout, None);
+            self.device.destroy_descriptor_pool(self.cull_descriptor_pool, None);
+            self.device.destroy_descriptor_set_layout(self.cull_set_layout, None);
 
             // Swapchain
             self.swapchain_loader

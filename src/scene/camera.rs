@@ -32,18 +32,23 @@ pub struct Camera3D {
     pub mouse_sensitivity: f32,
 }
 
+/// Eye offset above the player capsule center (capsule half_height=0.5, radius=0.4 → center at y=0.9 on ground).
+/// Camera at 0.9 + 0.7 = 1.6 m eye height.
+pub const EYE_OFFSET: f32 = 0.7;
+/// Y of the capsule center when standing on the ground (ground top = y=0).
+pub const PLAYER_SPAWN_Y: f32 = 0.9;
+
 impl Camera3D {
     pub fn new(aspect: f32) -> Self {
         Self {
-            // Start 2 units back on +Z, looking toward -Z (at the triangle).
-            position: Vec3::new(0.0, 0.0, 2.0),
+            position: Vec3::new(0.0, PLAYER_SPAWN_Y + EYE_OFFSET, 5.0),
             yaw: 0.0,
             pitch: 0.0,
             fov_y: 60.0f32.to_radians(),
             aspect,
             near: 0.1,
-            far: 100.0,
-            move_speed: 3.0,
+            far: 200.0,
+            move_speed: 5.0,
             mouse_sensitivity: 0.002,
         }
     }
@@ -78,43 +83,39 @@ impl Camera3D {
         self.projection() * self.view()
     }
 
-    /// Apply input accumulated this frame, advance camera state.
+    /// Update mouse/gamepad look only. Position is driven by physics (see `desired_move_velocity`).
     pub fn update(&mut self, input: &InputState, dt: f32) {
         if input.ui_captured {
             return;
         }
-
-        // Mouse look (accumulated delta this frame).
         self.yaw += input.mouse_delta.x * self.mouse_sensitivity;
         self.pitch = (self.pitch + input.mouse_delta.y * self.mouse_sensitivity)
             .clamp(-89.0f32.to_radians(), 89.0f32.to_radians());
 
-        // Gamepad right-stick look (scaled to feel similar to mouse at moderate sensitivity).
-        const GAMEPAD_LOOK_SPEED: f32 = 2.0; // radians per second per unit
+        const GAMEPAD_LOOK_SPEED: f32 = 2.0;
         self.yaw += input.gamepad_look.x * GAMEPAD_LOOK_SPEED * dt;
         self.pitch = (self.pitch + input.gamepad_look.y * GAMEPAD_LOOK_SPEED * dt)
             .clamp(-89.0f32.to_radians(), 89.0f32.to_radians());
+    }
 
-        // WASD movement relative to look direction.
-        let speed = if input.sprint { self.move_speed * 3.0 } else { self.move_speed };
-        let forward = self.forward();
-        let right = self.right();
+    /// Desired horizontal movement velocity based on current input and look direction.
+    /// The caller applies this to the physics body's XZ velocity each tick.
+    pub fn desired_move_velocity(&self, input: &InputState) -> Vec3 {
+        if input.ui_captured {
+            return Vec3::ZERO;
+        }
+        let fwd = Vec3::new(self.forward().x, 0.0, self.forward().z).normalize_or_zero();
+        let rgt = Vec3::new(self.right().x,   0.0, self.right().z  ).normalize_or_zero();
+        let speed = if input.sprint { self.move_speed * 2.0 } else { self.move_speed };
 
-        if input.forward {
-            self.position += forward * speed * dt;
-        }
-        if input.backward {
-            self.position -= forward * speed * dt;
-        }
-        if input.left {
-            self.position -= right * speed * dt;
-        }
-        if input.right {
-            self.position += right * speed * dt;
-        }
+        let mut vel = Vec3::ZERO;
+        if input.forward  { vel += fwd; }
+        if input.backward { vel -= fwd; }
+        if input.left     { vel -= rgt; }
+        if input.right    { vel += rgt; }
+        vel += fwd * (-input.gamepad_move.y);
+        vel += rgt *  input.gamepad_move.x;
 
-        // Gamepad left-stick movement (X = strafe, Y = forward/back; gilrs Y is inverted).
-        self.position += forward * (-input.gamepad_move.y) * speed * dt;
-        self.position += right   *  input.gamepad_move.x  * speed * dt;
+        vel.normalize_or_zero() * speed
     }
 }

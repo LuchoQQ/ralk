@@ -3,16 +3,19 @@ use glam::{Mat4, Vec3};
 
 /// GPU layout for the lighting uniform buffer (std140).
 /// All vec3s padded to vec4 (16 bytes). Mat4 follows at offset 80.
+/// Extended in Fase 23 to add view_proj and frustum_planes for GPU-driven rendering.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct LightingUbo {
-    pub dir_light_dir:    [f32; 4], // xyz = light-to-scene direction, w unused
-    pub dir_light_color:  [f32; 4], // xyz = color, w = intensity
-    pub point_light_pos:  [f32; 4], // xyz = world position, w unused
-    pub point_light_color:[f32; 4], // xyz = color, w = intensity
-    pub camera_pos:       [f32; 4], // xyz = world position, w unused
-    pub light_mvp:        [f32; 16], // orthographic light view-projection (column-major)
-}                                    // total: 80 + 64 = 144 bytes
+    pub dir_light_dir:    [f32; 4],    // offset   0 — xyz = light direction, w unused
+    pub dir_light_color:  [f32; 4],    // offset  16 — xyz = color, w = intensity
+    pub point_light_pos:  [f32; 4],    // offset  32 — xyz = world position, w unused
+    pub point_light_color:[f32; 4],    // offset  48 — xyz = color, w = intensity
+    pub camera_pos:       [f32; 4],    // offset  64 — xyz = world position, w = tone mode
+    pub light_mvp:        [f32; 16],   // offset  80 — orthographic shadow view-projection
+    pub view_proj:        [f32; 16],   // offset 144 — camera view-projection (for vertex shader + compute)
+    pub frustum_planes:   [[f32; 4]; 6], // offset 208 — world-space frustum planes (a,b,c,d) × 6
+}                                      // total: 208 + 96 = 304 bytes
 
 /// Orthographic shadow camera for a directional light.
 /// `direction` points FROM the light TOWARD the scene (same convention as DirectionalLight).
